@@ -1,0 +1,15 @@
+{
+  "_comment": "AI Game Master - Global Configuration (see docs for details)",
+  "ollama_url": "http://localhost:11434/v1",
+  "ollama_model": "phi3.5:3.8b-mini-instruct-q4_K_M",
+  "mcp_url": "http://localhost:8000",
+  "memory_max_events": 10000,
+  "enable_summarization": true,
+  "action_cooldown_ms": 150,
+  "frame_skip": 3,
+  "state_cache_ttl_seconds": 0.3,
+  "ocr_cache_ttl_seconds": 2.0,
+  "auto_focus_window": true,
+  "log_level": "INFO",
+  "input_backend": "auto"
+}

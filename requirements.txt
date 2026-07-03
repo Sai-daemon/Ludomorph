@@ -1,0 +1,39 @@
+#
+# AI Game Master - requirements.txt
+# Step 1.1: Project skeleton with all fixed dependencies
+#
+# Standard library (NOT listed here): tkinter, asyncio, json, sqlite3, subprocess,
+#   concurrent.futures, dataclasses, time, hashlib, threading
+#
+
+# --- Async HTTP ---
+httpx>=0.27.0
+
+# --- Screen Capture ---
+mss>=9.0.0
+# dxcam>=0.6.0            # Windows only, optional - Desktop Duplication API
+pywinctl>=0.3.0         # Cross-platform window tracking (Win/X11)
+
+# --- Input Injection ---
+pynput>=1.7.6           # Windows & X11
+python-ydotool>=0.2.0   # Linux Wayland (primary)
+pyautogui>=0.9.54       # Fallback only
+
+# --- OCR ---
+pytesseract>=0.3.10     # Tesseract wrapper (no aiopytesseract)
+
+# --- Image Processing ---
+opencv-python>=4.9.0
+
+# --- Logging ---
+loguru>=0.7.2
+
+# --- Cross-platform paths ---
+appdirs>=1.4.4          # ~/.gameai config directory
+
+# --- Utilities ---
+portend>=3.0.0          # Port checking
+tenacity>=9.0.0         # Retry logic
+
+# --- Optional: Vision module (Phase 4) ---
+onnxruntime>=1.18.0     # ONNX Runtime for YOLO model inference

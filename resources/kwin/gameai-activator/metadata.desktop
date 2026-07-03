@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=GameAI Activator
+Comment=Allows the Game AI Agent to focus windows by title via D-Bus
+Icon=preferences-system-windows
+
+X-KDE-PluginInfo-Name=gameai-activator
+X-KDE-PluginInfo-Category=Window Management
+X-KDE-PluginInfo-License=MIT
+X-KDE-PluginInfo-EnabledByDefault=false
+
+X-Plasma-API=javascript
+X-Plasma-MainScript=contents/code/main.js
