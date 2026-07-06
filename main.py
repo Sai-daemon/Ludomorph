@@ -7,11 +7,13 @@ into any PC game by capturing the screen and simulating keyboard/mouse input.
 
 Phase 1 (Foundation): asyncio engine, screen capture, input injection,
                       window management, static macro playback, Ollama check.
+Phase 2 (Perception & Decision): Full async perception → LLM → action loop.
 """
 
 import argparse
 import asyncio
 import json
+import signal
 import sys
 import traceback
 from pathlib import Path
@@ -23,7 +25,14 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.logging_config import setup_logging, get_logger
-from src.config_manager import load_global_config, list_profiles
+from src import __version__
+from src.config_manager import (
+    load_global_config,
+    list_profiles,
+    load_macros as load_profile_macros,
+    load_regions,
+    load_state_schema,
+)
 from src.input_controller import InputController, InputError
 from src.window_focus import WindowFocusManager
 from src.screen_capture import ScreenCapture, CaptureConfig, WindowTracker
@@ -111,6 +120,21 @@ def main() -> None:
         help="Seconds to wait before executing the macro, giving you time to "
         "switch focus to the target window (default: 3).",
     )
+    parser.add_argument(
+        "--loop",
+        dest="decision_loop",
+        action="store_true",
+        help="Run the Phase 2 decision loop (perception → LLM → action) "
+        "instead of the Phase 1 single-macro execution.",
+    )
+    parser.add_argument(
+        "--profile",
+        dest="profile_name",
+        default=None,
+        metavar="NAME",
+        help="Name of the game profile to use for the decision loop "
+        "(Phase 2). Must exist under ~/.gameai/profiles/<name>/.",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -122,7 +146,7 @@ def main() -> None:
     # Install crash-forensics hook as early as possible
     _install_excepthook()
 
-    logger.info("AI Game Master v0.1.0 starting up ...")
+    logger.info(f"AI Game Master v{__version__} starting up ...")
 
     if args.check_only:
         logger.info("Running in CHECK mode — no macros will be executed.")
@@ -174,9 +198,13 @@ def main() -> None:
     logger.info(f"Window focus manager ready. Compositor: {focus_mgr.compositor.value}")
 
     # ------------------------------------------------------------------
-    # 6-9. Run the async main coroutine.
+    # 6. Dispatch to Phase 1 or Phase 2 based on CLI flags.
     # ------------------------------------------------------------------
-    asyncio.run(_phase1_main(config, input_ctrl, args))
+    if args.decision_loop:
+        logger.info("--- Phase 2 Decision Loop ---")
+        asyncio.run(_phase2_main(config, input_ctrl, args))
+    else:
+        asyncio.run(_phase1_main(config, input_ctrl, args))
 
 
 async def _phase1_main(config: dict[str, Any], input_ctrl: Any, args: Any) -> None:
@@ -255,6 +283,208 @@ async def _phase1_main(config: dict[str, Any], input_ctrl: Any, args: Any) -> No
         logger.warning(f"Ollama health issue: {health.error}")
 
     logger.info("Phase 1 done.")
+
+
+# =============================================================================
+# Phase 2 entry point  (perception → LLM → action loop)
+# =============================================================================
+
+
+async def _phase2_main(
+    config: dict[str, Any],
+    input_ctrl: InputController,
+    args: Any,
+) -> None:
+    """Run the Phase 2 decision loop.
+
+    Requires a profile name (``--profile``) whose ``regions.json``,
+    ``state_schema.json``, and ``macros.json`` are loaded from
+    ``~/.gameai/profiles/<name>/``.
+
+    Falls back to the bundled ``config/`` directory files if the
+    profile directory is not found.
+    """
+    profile_name: str = args.profile_name or ""
+
+    # ------------------------------------------------------------------
+    # 1. Resolve profile files
+    # ------------------------------------------------------------------
+    _CONFIG_DIR = _PROJECT_ROOT / "config"
+
+    # State schema
+    schema_data: dict[str, Any] | None = None
+    if profile_name:
+        schema_data = load_state_schema(profile_name)
+    if not schema_data or not schema_data.get("slots"):
+        # Fall back to the bundled schema in config/state_schema.json
+        fallback = _CONFIG_DIR / "state_schema.json"
+        if fallback.exists():
+            schema_data = json.loads(fallback.read_text(encoding="utf-8"))
+        else:
+            logger.error(
+                "No state_schema.json found for profile %r or in %s",
+                profile_name,
+                _CONFIG_DIR,
+            )
+            sys.exit(1)
+
+    # Regions
+    regions_data: dict[str, Any] | None = None
+    if profile_name:
+        regions_data = load_regions(profile_name)
+    if not regions_data or not regions_data.get("regions"):
+        fallback = _CONFIG_DIR / "regions.json"
+        if fallback.exists():
+            regions_data = json.loads(fallback.read_text(encoding="utf-8"))
+        else:
+            logger.error(
+                "No regions.json found for profile %r or in %s",
+                profile_name,
+                _CONFIG_DIR,
+            )
+            sys.exit(1)
+
+    # Macros
+    macros_data: list[dict[str, Any]] = []
+    if profile_name:
+        macros_data = load_profile_macros(profile_name)
+    if not macros_data:
+        fallback = _CONFIG_DIR / "macros.json"
+        if fallback.exists():
+            raw = json.loads(fallback.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                macros_data = raw.get("macros", [])
+            elif isinstance(raw, list):
+                macros_data = raw
+    if not macros_data:
+        logger.warning(
+            "No macros found for profile %r or in %s — "
+            "LLM will have no actions to choose.",
+            profile_name,
+            _CONFIG_DIR,
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Build StateSchema and RegionProfile
+    # ------------------------------------------------------------------
+    from src.game_state import StateSchema
+    from src.region_profile import RegionProfile
+
+    try:
+        schema = StateSchema.from_dict(schema_data)
+        logger.info(
+            "State schema loaded: %d slot(s)",
+            len(schema.slots),
+        )
+    except Exception as exc:
+        logger.error(f"Failed to load state schema: {exc}")
+        sys.exit(1)
+
+    try:
+        profile = RegionProfile.from_dict(regions_data)
+        logger.info(
+            "Region profile loaded: %d region(s)",
+            len(profile.regions),
+        )
+    except Exception as exc:
+        logger.error(f"Failed to load region profile: {exc}")
+        sys.exit(1)
+
+    # Validate region roles against schema (non‑fatal warnings)
+    region_roles = {
+        r.role
+        for r in profile.regions
+        if r.role
+    }
+    warnings = schema.validate_region_roles(region_roles)
+    for w in warnings:
+        logger.warning(w)
+
+    # ------------------------------------------------------------------
+    # 3. Set up OCR module
+    # ------------------------------------------------------------------
+    from src.ocr_module import OCRModule, OCRConfig
+
+    ocr_config = OCRConfig(
+        cache_ttl_seconds=config.get("ocr_cache_ttl_seconds", 2.0),
+    )
+    ocr = OCRModule(ocr_config)
+    logger.info("OCR module initialised.")
+
+    # ------------------------------------------------------------------
+    # 4. Build StateProcessor
+    # ------------------------------------------------------------------
+    from src.state_processor import StateProcessor
+
+    state_processor = StateProcessor(
+        profile=profile,
+        ocr_module=ocr,
+        schema=schema,
+        vision_processor=None,  # Phase 4 stub
+        cache_ttl=config.get("state_cache_ttl_seconds", 0.3),
+    )
+    logger.info("StateProcessor initialised.")
+
+    # ------------------------------------------------------------------
+    # 5. Set up screen capture
+    # ------------------------------------------------------------------
+    capture_config = CaptureConfig()
+    tracker = WindowTracker(capture_config)
+    capture = ScreenCapture(capture_config, tracker=tracker)
+
+    test_frame = await capture.capture()
+    if test_frame is not None:
+        h, w = test_frame.shape[:2]
+        logger.info(f"Capture OK — frame {w}×{h}")
+    else:
+        logger.warning(
+            "Initial capture returned None — "
+            "is a game window visible?"
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Start MacroExecutor
+    # ------------------------------------------------------------------
+    macro_executor = MacroExecutor(input_ctrl)
+    await macro_executor.start()
+
+    # ------------------------------------------------------------------
+    # 7. Run the decision loop
+    # ------------------------------------------------------------------
+    from src.decision_loop import decision_loop
+
+    # Set up graceful shutdown on SIGINT / SIGTERM
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+
+    def _shutdown_callback() -> None:
+        logger.info("Shutdown signal received.")
+        if main_task is not None:
+            main_task.cancel()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _shutdown_callback)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
+    try:
+        await decision_loop(
+            state_processor=state_processor,
+            macro_executor=macro_executor,
+            profile_macros=macros_data,
+            config=config,
+            capture_obj=capture,
+            mcp=None,  # stubbed — Phase 3
+        )
+    except asyncio.CancelledError:
+        logger.info("Phase 2 main cancelled — shutting down.")
+    finally:
+        # Cleanup
+        await macro_executor.stop()
+        await capture.close()
+        logger.info("Phase 2 shutdown complete.")
 
 
 if __name__ == "__main__":

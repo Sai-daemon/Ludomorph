@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "macros": [
+    {
+      "name": "drink_potion",
+      "description": "Drink a health potion to restore HP",
+      "actions": [
+        {"type": "key", "key": "q", "hold_ms": 100}
+      ]
+    },
+    {
+      "name": "WAIT",
+      "description": "Do nothing — wait",
+      "actions": [
+        {"type": "delay", "ms": 200}
+      ]
+    },
+    {
+      "name": "move_forward",
+      "description": "Press W for half a second",
+      "actions": [
+        {"type": "key", "key": "w", "hold_ms": 500}
+      ]
+    },
+    {
+      "name": "attack",
+      "description": "Press A to attack",
+      "actions": [
+        {"type": "key", "key": "a", "hold_ms": 100}
+      ]
+    }
+  ]
+}

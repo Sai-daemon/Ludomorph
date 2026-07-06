@@ -6,7 +6,22 @@
   "memory_max_events": 10000,
   "enable_summarization": true,
   "action_cooldown_ms": 150,
-  "frame_skip": 3,
+  "diff": {
+    "downsample_width": 640,
+    "downsample_height": 360,
+    "method": "absdiff_mean",
+    "adaptive": {
+      "enabled": true,
+      "window_size": 30,
+      "static_percentile": 70,
+      "high_motion_percentile": 85
+    },
+    "perceptual_hash_fallback": {
+      "enabled": false,
+      "method": "opencv_dhash",
+      "hamming_threshold": 6
+    }
+  },
   "state_cache_ttl_seconds": 0.3,
   "ocr_cache_ttl_seconds": 2.0,
   "auto_focus_window": true,

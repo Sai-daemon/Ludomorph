@@ -6,6 +6,8 @@ Handles:
 - Per-game profiles under ~/.gameai/profiles/<name>/
   - settings.json (per-profile overrides of global config)
   - macros.json (macro definitions)
+  - state_schema.json (Phase 2.1 — state slot definitions)
+  - regions.json (Phase 2.1 — screen region definitions with role mapping)
 """
 
 import json
@@ -31,7 +33,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "memory_max_events": 10000,
     "enable_summarization": True,
     "action_cooldown_ms": 150,
-    "frame_skip": 3,
+    "diff": {
+        "downsample_width": 640,
+        "downsample_height": 360,
+        "method": "absdiff_mean",
+        "adaptive": {
+            "enabled": True,
+            "window_size": 30,
+            "static_percentile": 70,
+            "high_motion_percentile": 85,
+        },
+        "perceptual_hash_fallback": {
+            "enabled": False,
+            "method": "opencv_dhash",
+            "hamming_threshold": 6,
+        },
+    },
     "state_cache_ttl_seconds": 0.3,
     "ocr_cache_ttl_seconds": 2.0,
     "auto_focus_window": True,
@@ -40,6 +57,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 DEFAULT_MACROS: list[dict[str, Any]] = []
+
+# ---------------------------------------------------------------------------
+# Defaults for Phase 2.1 profile files
+# ---------------------------------------------------------------------------
+
+DEFAULT_STATE_SCHEMA: dict[str, Any] = {
+    "schema_version": "1.0.0",
+    "slots": {
+        "health": {"type": "numeric", "priority": "color_first"},
+        "health_text": {"type": "text", "priority": "ocr_first"},
+        "mana": {"type": "numeric", "priority": "color_first"},
+        "mana_text": {"type": "text", "priority": "ocr_first"},
+        "location": {"type": "text", "priority": "ocr_first"},
+        "inventory": {"type": "text", "priority": "ocr_first"},
+        "objective": {"type": "text", "priority": "ocr_first"},
+        "enemy_present": {"type": "boolean", "priority": "ocr_first"},
+    },
+}
+
+DEFAULT_REGIONS: dict[str, Any] = {
+    "version": "1.0.0",
+    "regions": [],
+}
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -69,6 +109,14 @@ def profile_settings_path(name: str) -> Path:
 
 def profile_macros_path(name: str) -> Path:
     return profile_dir(name) / "macros.json"
+
+
+def profile_state_schema_path(name: str) -> Path:
+    return profile_dir(name) / "state_schema.json"
+
+
+def profile_regions_path(name: str) -> Path:
+    return profile_dir(name) / "regions.json"
 
 
 # ---------------------------------------------------------------------------
@@ -219,3 +267,64 @@ def save_macros(name: str, macros: list[dict[str, Any]]) -> None:
     profile_dir(name).mkdir(parents=True, exist_ok=True)
     _atomic_write_json(profile_macros_path(name), macros)
     logger.info(f"Profile '{name}' macros saved.")
+
+
+# ---------------------------------------------------------------------------
+# State Schema (Phase 2.1)
+# ---------------------------------------------------------------------------
+
+def load_state_schema(name: str) -> dict[str, Any]:
+    """
+    Load the state schema for a profile.
+
+    Returns DEFAULT_STATE_SCHEMA if the file doesn't exist or is unparseable.
+    """
+    path = profile_state_schema_path(name)
+    data = load_json(path)
+    if data is None:
+        logger.info(f"No state_schema.json for profile '{name}'; using defaults.")
+        return dict(DEFAULT_STATE_SCHEMA)
+    if not isinstance(data, dict):
+        logger.warning(
+            f"state_schema.json for profile '{name}' is not a dict; using defaults."
+        )
+        return dict(DEFAULT_STATE_SCHEMA)
+    return data
+
+
+def save_state_schema(name: str, schema: dict[str, Any]) -> None:
+    """Atomically save the state schema for a profile."""
+    profile_dir(name).mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(profile_state_schema_path(name), schema)
+    logger.info(f"Profile '{name}' state schema saved.")
+
+
+# ---------------------------------------------------------------------------
+# Regions (Phase 2.1)
+# ---------------------------------------------------------------------------
+
+def load_regions(name: str) -> dict[str, Any]:
+    """
+    Load the region definitions for a profile.
+
+    Returns DEFAULT_REGIONS (empty region list) if the file doesn't exist
+    or is unparseable.
+    """
+    path = profile_regions_path(name)
+    data = load_json(path)
+    if data is None:
+        logger.info(f"No regions.json for profile '{name}'; using defaults.")
+        return dict(DEFAULT_REGIONS)
+    if not isinstance(data, dict):
+        logger.warning(
+            f"regions.json for profile '{name}' is not a dict; using defaults."
+        )
+        return dict(DEFAULT_REGIONS)
+    return data
+
+
+def save_regions(name: str, regions: dict[str, Any]) -> None:
+    """Atomically save the region definitions for a profile."""
+    profile_dir(name).mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(profile_regions_path(name), regions)
+    logger.info(f"Profile '{name}' regions saved.")

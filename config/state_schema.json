@@ -1,0 +1,37 @@
+{
+  "schema_version": "1.0.0",
+  "slots": {
+    "health": {
+      "type": "numeric",
+      "priority": "color_first"
+    },
+    "health_text": {
+      "type": "text",
+      "priority": "ocr_first"
+    },
+    "mana": {
+      "type": "numeric",
+      "priority": "color_first"
+    },
+    "mana_text": {
+      "type": "text",
+      "priority": "ocr_first"
+    },
+    "location": {
+      "type": "text",
+      "priority": "ocr_first"
+    },
+    "inventory": {
+      "type": "text",
+      "priority": "ocr_first"
+    },
+    "objective": {
+      "type": "text",
+      "priority": "ocr_first"
+    },
+    "enemy_present": {
+      "type": "boolean",
+      "priority": "ocr_first"
+    }
+  }
+}

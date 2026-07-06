@@ -21,6 +21,7 @@ pyautogui>=0.9.54       # Fallback only
 
 # --- OCR ---
 pytesseract>=0.3.10     # Tesseract wrapper (no aiopytesseract)
+Pillow>=10.0.0          # PIL.Image for OCR preprocessing
 
 # --- Image Processing ---
 opencv-python>=4.9.0
@@ -31,9 +32,16 @@ loguru>=0.7.2
 # --- Cross-platform paths ---
 appdirs>=1.4.4          # ~/.gameai config directory
 
+# --- Schema validation / LLM constraints (Phase 2.7+) ---
+pydantic>=2.0.0
+
 # --- Utilities ---
 portend>=3.0.0          # Port checking
 tenacity>=9.0.0         # Retry logic
 
 # --- Optional: Vision module (Phase 4) ---
 onnxruntime>=1.18.0     # ONNX Runtime for YOLO model inference
+
+# --- Testing (Phase 2.10+) ---
+pytest>=8.0.0
+pytest-asyncio>=0.24.0

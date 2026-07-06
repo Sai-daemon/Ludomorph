@@ -115,6 +115,14 @@ class MacroRequest:
     future: asyncio.Future[None] = field(default_factory=asyncio.Future)
     timeout: Optional[float] = None
 
+    def __lt__(self, other: "MacroRequest") -> bool:
+        """Compare by priority first, then by id for deterministic ordering.
+
+        Required by ``asyncio.PriorityQueue`` which uses ``heapq.heappop``
+        (calls ``__lt__`` when two items have the same priority).
+        """
+        return (self.priority, self.id) < (other.priority, other.id)
+
 
 # ============================================================================
 # Accurate key‑hold timer
