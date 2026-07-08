@@ -134,7 +134,7 @@ def parse_llm_response(
             return action
         else:
             logger.debug(
-                "LLM returned unknown action %r (allowed: %s)",
+                "LLM returned unknown action {!r} (allowed: {})",
                 action,
                 sorted(valid_macros),
             )
@@ -144,13 +144,13 @@ def parse_llm_response(
     if match:
         action = match.group(1).strip()
         if action in valid_macros:
-            logger.debug("Regex-extracted action %r from garbled LLM response", action)
+            logger.debug("Regex-extracted action {!r} from garbled LLM response", action)
             return action
 
     # 3) If the entire string is a single word that matches a macro
     single_word = text.split()[0].strip().upper()
     if single_word in valid_macros:
-        logger.debug("Single-word fallback action %r", single_word)
+        logger.debug("Single-word fallback action {!r}", single_word)
         return single_word
 
     return None
@@ -200,32 +200,24 @@ async def call_llm_decision(
     if not valid_names:
         valid_names = {_DEFAULT_FALLBACK}
 
-    # Build JSON schema constraint
-    try:
-        MacroAction = get_macro_model(profile_macros)
-        schema = MacroAction.model_json_schema()
-    except ImportError:
-        logger.error("pydantic is required for Phase 2.7 LLM decision calls")
-        return last_action or _DEFAULT_FALLBACK
-    except Exception as exc:
-        logger.error("Failed to build macro schema: %s", exc)
-        return last_action or _DEFAULT_FALLBACK
-
-    # Build request payload
+    # Build request payload — do NOT use "format": "json" because
+    # phi3.5 models do not support the Ollama structured output
+    # feature (requires Ollama >= 0.5.0 and specific model support).
+    # The parse_llm_response() fallback chain (JSON → regex → single-word)
+    # handles extraction from raw text reliably.
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "format": schema,
         "options": {
             "temperature": 0,
-            "num_predict": 20,
+            "num_predict": 15,
             "num_ctx": 4096,
         },
         "stream": False,
     }
 
     logger.debug(
-        "Calling Ollama /api/chat — model=%r, macros=%s, timeout=%.0fms",
+        "Calling Ollama /api/chat — model={!r}, macros={}, timeout={:.0f}ms",
         model,
         sorted(valid_names),
         timeout * 1000,
@@ -233,7 +225,7 @@ async def call_llm_decision(
 
     # Connection timeout from config (generous, only applies to connect+read).
     # The decision-timeout is enforced by asyncio.wait_for below.
-    httpx_timeout = httpx.Timeout(2.0, connect=1.0)
+    httpx_timeout = httpx.Timeout(timeout, connect=min(1.0, timeout * 0.2))
     async with httpx.AsyncClient(timeout=httpx_timeout) as client:
         try:
             response_data = await asyncio.wait_for(
@@ -242,22 +234,21 @@ async def call_llm_decision(
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "LLM decision timed out after %.0fms; falling back to %r",
+                "LLM decision timed out after {:.0f}ms; falling back to {!r}",
                 timeout * 1000,
                 last_action or _DEFAULT_FALLBACK,
             )
             return last_action or _DEFAULT_FALLBACK
         except httpx.ConnectError:
             logger.error(
-                "Ollama unreachable at %s; falling back to %r",
+                "Ollama unreachable at {}; falling back to {!r}",
                 base_url,
                 last_action or _DEFAULT_FALLBACK,
             )
             return last_action or _DEFAULT_FALLBACK
-        except Exception as exc:
-            logger.error(
-                "LLM decision call failed: %s; falling back to %r",
-                exc,
+        except Exception:
+            logger.exception(
+                "LLM decision call failed; falling back to {!r}",
                 last_action or _DEFAULT_FALLBACK,
             )
             return last_action or _DEFAULT_FALLBACK
@@ -274,12 +265,17 @@ async def call_llm_decision(
     action = parse_llm_response(content, valid_names)
 
     if action is not None:
-        logger.info("LLM chose action: %r", action)
+        logger.info("LLM chose action: {!r}", action)
         return action
 
     # Fallback to last_action, then WAIT
     fallback = last_action or _DEFAULT_FALLBACK
-    logger.warning("Could not parse LLM response %r; falling back to %r", content, fallback)
+    logger.debug(
+        "LLM raw response content (len={}): {!r}",
+        len(content),
+        content,
+    )
+    logger.debug("Could not parse LLM response {!r}; falling back to {!r}", content, fallback)
     return fallback
 
 
@@ -299,7 +295,16 @@ async def _post_chat(
     """
     resp = await client.post(f"{base_url}/api/chat", json=payload)
     resp.raise_for_status()
-    return resp.json()
+    try:
+        return resp.json()
+    except Exception:
+        body = resp.text[:500] if hasattr(resp, 'text') else '(no body)'
+        logger.error(
+            "Ollama returned non-JSON response (status={}): {!r}",
+            resp.status_code,
+            body,
+        )
+        raise
 
 
 def _strip_openai_suffix(url: str) -> str:

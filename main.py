@@ -38,6 +38,7 @@ from src.window_focus import WindowFocusManager
 from src.screen_capture import ScreenCapture, CaptureConfig, WindowTracker
 from src.macro_executor import MacroExecutor, MacroRequest, MacroPriority
 from src.ollama_health import ollama_health_check
+from src.mcp_server import MCPServerManager
 
 logger = get_logger(__name__)
 
@@ -200,14 +201,45 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 6. Dispatch to Phase 1 or Phase 2 based on CLI flags.
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 6a. Start MCP memory server (Phase 3.1) if enabled
+    # ------------------------------------------------------------------
+    mcp_manager: MCPServerManager | None = None
+    mcp_enabled: bool = config.get("mcp_enabled", True)
+
+    if mcp_enabled:
+        mcp_manager = MCPServerManager(
+            port=8000,  # fixed per spec
+            ready_timeout=10.0,
+            grace_period=5.0,
+        )
+        try:
+            # Start is blocking until ready — run inside a temp event loop
+            # or schedule it within the main async entry point.
+            # We defer the actual start to the async entry points below.
+            logger.info("MCP memory server will be started in async context.")
+        except Exception as exc:
+            logger.warning("MCP server setup failed: {} — memory tier disabled.", exc)
+            mcp_manager = None
+    else:
+        logger.info("MCP memory server disabled in config (mcp_enabled=false).")
+
+    # ------------------------------------------------------------------
+    # 7. Dispatch to Phase 1 or Phase 2 based on CLI flags.
+    # ------------------------------------------------------------------
     if args.decision_loop:
         logger.info("--- Phase 2 Decision Loop ---")
-        asyncio.run(_phase2_main(config, input_ctrl, args))
+        asyncio.run(_phase2_main(config, input_ctrl, args, mcp_manager))
     else:
-        asyncio.run(_phase1_main(config, input_ctrl, args))
+        asyncio.run(_phase1_main(config, input_ctrl, args, mcp_manager))
 
 
-async def _phase1_main(config: dict[str, Any], input_ctrl: Any, args: Any) -> None:
+async def _phase1_main(
+    config: dict[str, Any],
+    input_ctrl: Any,
+    args: Any,
+    mcp_manager: MCPServerManager | None = None,
+) -> None:
     """
     Phase 1 main coroutine.
 
@@ -282,6 +314,10 @@ async def _phase1_main(config: dict[str, Any], input_ctrl: Any, args: Any) -> No
     else:
         logger.warning(f"Ollama health issue: {health.error}")
 
+    # -- MCP memory server cleanup (Phase 3.1) --
+    if mcp_manager is not None:
+        await mcp_manager.stop()
+
     logger.info("Phase 1 done.")
 
 
@@ -294,6 +330,7 @@ async def _phase2_main(
     config: dict[str, Any],
     input_ctrl: InputController,
     args: Any,
+    mcp_manager: MCPServerManager | None = None,
 ) -> None:
     """Run the Phase 2 decision loop.
 
@@ -303,7 +340,24 @@ async def _phase2_main(
 
     Falls back to the bundled ``config/`` directory files if the
     profile directory is not found.
+
+    Phase 3.1: If *mcp_manager* is provided, the MCP memory server
+    is started before the decision loop and stopped on exit.
     """
+    # ------------------------------------------------------------------
+    # 0. Start MCP memory server (Phase 3.1)
+    # ------------------------------------------------------------------
+    if mcp_manager is not None:
+        try:
+            await mcp_manager.start()
+        except RuntimeError as exc:
+            logger.warning(
+                "MCP memory server failed to start: {} — "
+                "memory tier disabled for this session.",
+                exc,
+            )
+            mcp_manager = None
+
     profile_name: str = args.profile_name or ""
 
     # ------------------------------------------------------------------
@@ -469,6 +523,35 @@ async def _phase2_main(
             # Windows doesn't support add_signal_handler
             pass
 
+    # --- Instantiate real MCP client if server is healthy ---
+    mcp_client: Any = None
+    if mcp_manager is not None and mcp_manager.is_healthy:
+        from src.mcp_client import MCPMemoryClient
+        mcp_client = MCPMemoryClient(
+            base_url=config.get("mcp_url", "http://localhost:8000"),
+        )
+        logger.info("MCPMemoryClient connected to {}", mcp_client.base_url)
+
+    # --- Phase 3.4: Automatic summarisation background task ---
+    summariser: Any = None
+    enable_summarization: bool = config.get("enable_summarization", True)
+    if mcp_client is not None and enable_summarization:
+        from src.memory_summariser import MemorySummariser
+
+        summarisation_model = config.get(
+            "summarization_model", config.get("ollama_model", "")
+        )
+        summariser = MemorySummariser(
+            client=mcp_client,
+            ollama_url=config.get("ollama_url", "http://localhost:11434/v1"),
+            model=summarisation_model,
+        )
+        await summariser.start()
+    elif not enable_summarization:
+        logger.info("Automatic summarisation disabled in config.")
+    elif mcp_client is None:
+        logger.info("MCP client unavailable — summarisation disabled.")
+
     try:
         await decision_loop(
             state_processor=state_processor,
@@ -476,14 +559,24 @@ async def _phase2_main(
             profile_macros=macros_data,
             config=config,
             capture_obj=capture,
-            mcp=None,  # stubbed — Phase 3
+            mcp=mcp_client,
+            summariser=summariser,  # Phase 3.4
         )
     except asyncio.CancelledError:
         logger.info("Phase 2 main cancelled — shutting down.")
     finally:
         # Cleanup
+        # Stop summariser first (Phase 3.4)
+        if summariser is not None:
+            await summariser.stop()
         await macro_executor.stop()
         await capture.close()
+        # Close MCP client (Phase 3.2)
+        if mcp_client is not None:
+            await mcp_client.close()
+        # Stop MCP memory server (Phase 3.1)
+        if mcp_manager is not None:
+            await mcp_manager.stop()
         logger.info("Phase 2 shutdown complete.")
 
 

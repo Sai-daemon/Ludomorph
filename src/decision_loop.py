@@ -22,11 +22,11 @@ Pipeline
     │  3. Throttle-driven OCR skip                 │
     │  4. StateProcessor.process() ≤ 250 ms        │
     │  5. State cache lookup (Phase 2.5)           │
-    │  6. MCP memory query (stubbed)               │
+    │  6. MCP memory query (real, Phase 3.3)      │
     │  7. build_llm_prompt()                       │
     │  8. call_llm_decision() ≤ 200 ms             │
     │  9. MacroExecutor.submit() ≤ 500 ms          │
-    │ 10. Store event (fire‑and‑forget, stubbed)   │
+    │ 10. Store event (real, Phase 3.3)            │
     │ 11. Latency monitoring + adaptive throttling │
     └──────────────────────────────────────────────┘
 
@@ -119,48 +119,6 @@ class ThrottleState:
 
 
 # ---------------------------------------------------------------------------
-# MCP Stub  (Phase 2 — real MCP integration arrives in Phase 3)
-# ---------------------------------------------------------------------------
-
-
-class MCPStub:
-    """Minimal MCP client stub that returns empty results and no-ops storage.
-
-    Every call is logged at DEBUG level so operators can verify the
-    integration points are being hit.
-    """
-
-    async def search_memories(
-        self,
-        query: str,
-        tags: list[str] | None = None,
-        limit: int = 5,
-    ) -> list[dict[str, Any]]:
-        """Stub — always returns an empty list."""
-        logger.debug(
-            "MCP search_memories (stub): query=%r tags=%s limit=%d",
-            query,
-            tags,
-            limit,
-        )
-        return []
-
-    async def store_memory(
-        self,
-        content: str,
-        memory_type: str = "short_term",
-        tags: list[str] | None = None,
-    ) -> None:
-        """Stub — logs and discards."""
-        logger.debug(
-            "MCP store_memory (stub): type=%r tags=%s content_len=%d",
-            memory_type,
-            tags,
-            len(content),
-        )
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -180,11 +138,22 @@ def find_macro_by_name(
 
 
 def build_memory_query(state: Any) -> str:
-    """Build a simple query string from the current game state.
+    """Build a concise query string from the current game state.
 
-    Used to search MCP memories for relevant past events.  Only the
-    first five non‑internal schema slots are included.
+    Delegates to ``MCPMemoryClient.build_memory_query`` — a richer
+    8‑field version with comma‑separated format suitable for semantic
+    search (Phase 3.2).  Falls back to a plain "game state" string if
+    the MCP client module is not importable.
     """
+    try:
+        from src.mcp_client import MCPMemoryClient
+
+        return MCPMemoryClient.build_memory_query(state)
+    except ImportError:
+        pass
+
+    # Fallback when MCP client is not available (should not happen
+    # in practice, but keeps the function self‑contained).
     if hasattr(state, "to_dict"):
         state_dict = state.to_dict()
     elif isinstance(state, dict):
@@ -341,6 +310,7 @@ async def decision_loop(
     config: dict[str, Any],
     capture_obj: Any,
     mcp: Any = None,
+    summariser: Any = None,
 ) -> None:
     """Run the main perception → decision → action loop.
 
@@ -358,11 +328,17 @@ async def decision_loop(
             ``"actions"`` keys.
         config: Global configuration dict (Phase 1.1).
         capture_obj: ``ScreenCapture`` instance (Phase 1.2).
-        mcp: Optional MCP client.  If ``None``, an internal
-            :class:`MCPStub` is used (Phase 2 stub).
+        mcp: Optional ``MCPMemoryClient`` instance (Phase 3.2).  If
+            ``None``, memory query and storage are silently skipped
+            (memory tier disabled for this session).
+        summariser: Optional ``MemorySummariser`` instance (Phase 3.4).
+            If ``None``, automatic summarisation is disabled.
     """
-    if mcp is None:
-        mcp = MCPStub()
+    _mcp_unavailable = mcp is None
+    if _mcp_unavailable:
+        logger.warning(
+            "MCP client unavailable — memory tier disabled for this session."
+        )
 
     # --- Adaptive frame skipper (Phase 2.8) ---
     diff_config = _diff_config_from_global(config)
@@ -474,18 +450,29 @@ async def decision_loop(
             cached_action = state_processor.get_cached_action(state)
             if cached_action is not None:
                 logger.debug(
-                    "Cache hit — reusing action %r", cached_action
+                    "Cache hit — reusing action {!r}", cached_action
                 )
                 action = cached_action
             else:
                 # ------------------------------------------------------
-                # 6. Query MCP memories  (stubbed)
+                # 6. Query MCP memories  (Phase 3.3 — real)
                 # ------------------------------------------------------
-                memories = await mcp.search_memories(
-                    query=build_memory_query(state),
-                    tags=["game_event"],
-                    limit=5,
-                )
+                if not _mcp_unavailable:
+                    try:
+                        memories = await mcp.search_memories(
+                            query=build_memory_query(state),
+                            tags=["game_event"],
+                            limit=5,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MCP search_memories failed ({}) — "
+                            "continuing without memories.",
+                            exc,
+                        )
+                        memories = []
+                else:
+                    memories = []
 
                 # ------------------------------------------------------
                 # 7. Build LLM prompt
@@ -510,11 +497,11 @@ async def decision_loop(
                         profile_macros=profile_macros,
                         config=config,
                         last_action=last_action,
-                        timeout=0.200,
+                        timeout=config.get("llm_timeout_ms", 200) / 1000.0,
                     )
                 except Exception as exc:
                     logger.error(
-                        "LLM decision call raised: %s", exc
+                        "LLM decision call raised: {}", exc
                     )
                     action = last_action or _DEFAULT_FALLBACK_ACTION
 
@@ -544,47 +531,59 @@ async def decision_loop(
                         )
                     except asyncio.TimeoutError:
                         logger.debug(
-                            "Macro '%s' still executing; continuing loop.",
+                            "Macro {!r} still executing; continuing loop.",
                             action,
                         )
                     except Exception as exc:
                         logger.warning(
-                            "Macro '%s' submission failed: %s",
+                            "Macro {!r} submission failed: {}",
                             action,
                             exc,
                         )
                 else:
                     logger.debug(
-                        "Macro %r has no action steps; treating as no-op.",
+                        "Macro {!r} has no action steps; treating as no-op.",
                         action,
                     )
             else:
                 if action != _DEFAULT_FALLBACK_ACTION:
                     logger.warning(
-                        "LLM chose unrecognised macro %r; no action taken.",
+                        "LLM chose unrecognised macro {!r}; no action taken.",
                         action,
                     )
                 action = _DEFAULT_FALLBACK_ACTION
 
             # ----------------------------------------------------------
-            # 10. Store event  (fire‑and‑forget, stubbed MCP)
+            # 10. Store event  (fire‑and‑forget, Phase 3.3)
             # ----------------------------------------------------------
-            asyncio.create_task(
-                mcp.store_memory(
-                    content=json.dumps(
-                        {
-                            "state": (
-                                state.to_dict()
-                                if hasattr(state, "to_dict")
-                                else {}
+            if not _mcp_unavailable:
+
+                async def _store_and_log() -> None:
+                    try:
+                        await mcp.store_memory(
+                            content=json.dumps(
+                                {
+                                    "state": (
+                                        state.to_dict()
+                                        if hasattr(state, "to_dict")
+                                        else {}
+                                    ),
+                                    "action": action,
+                                }
                             ),
-                            "action": action,
-                        }
-                    ),
-                    memory_type="short_term",
-                    tags=["game_event", "auto"],
-                )
-            )
+                            memory_type="short_term",
+                            tags=["game_event", "auto"],
+                        )
+                        # Notify the summariser of a new event (Phase 3.4)
+                        if summariser is not None:
+                            await summariser.record_new_event()
+                    except Exception as exc:
+                        logger.warning(
+                            "MCP store_memory failed — event not persisted: {}",
+                            exc,
+                        )
+
+                asyncio.create_task(_store_and_log())
 
             # ----------------------------------------------------------
             # 11. Latency monitoring & adaptive throttling
@@ -604,8 +603,8 @@ async def decision_loop(
             if high_latency_count >= _LATENCY_SPIKE_COUNT:
                 if not throttle.active:
                     logger.warning(
-                        "High latency detected (%.0f ms avg over %d cycles) — "
-                        "engaging adaptive throttling.",
+                    "High latency detected ({:.0f}ms avg over {} cycles) — "
+                    "engaging adaptive throttling.",
                         sum(latency_ring[-_LATENCY_SPIKE_COUNT:])
                         / _LATENCY_SPIKE_COUNT,
                         _LATENCY_SPIKE_COUNT,
@@ -638,7 +637,7 @@ async def decision_loop(
         except asyncio.CancelledError:
             pass
         logger.info(
-            "Decision loop stopped. Total frames processed: %d",
+            "Decision loop stopped. Total frames processed: {}",
             frame_counter,
         )
 
@@ -651,7 +650,6 @@ __all__ = [
     "decision_loop",
     "capture_producer",
     "ThrottleState",
-    "MCPStub",
     "find_macro_by_name",
     "build_memory_query",
     "check_high_priority_event",

@@ -3,9 +3,12 @@
   "ollama_url": "http://localhost:11434/v1",
   "ollama_model": "phi3.5:3.8b-mini-instruct-q4_K_M",
   "mcp_url": "http://localhost:8000",
+  "mcp_enabled": true,
+  "summarization_model": "phi3.5:3.8b-mini-instruct-q4_K_M",
   "memory_max_events": 10000,
   "enable_summarization": true,
   "action_cooldown_ms": 150,
+  "llm_timeout_ms": 200,
   "diff": {
     "downsample_width": 640,
     "downsample_height": 360,

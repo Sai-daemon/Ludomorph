@@ -38,6 +38,7 @@ pydantic>=2.0.0
 # --- Utilities ---
 portend>=3.0.0          # Port checking
 tenacity>=9.0.0         # Retry logic
+psutil>=5.9.0           # Process tree management (MCP server lifecycle)
 
 # --- Optional: Vision module (Phase 4) ---
 onnxruntime>=1.18.0     # ONNX Runtime for YOLO model inference

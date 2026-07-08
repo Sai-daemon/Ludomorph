@@ -4,16 +4,17 @@ Have a local LLM play your game, in realish time.
 
 Currently a work in progress.
 
-Version 0.2.0
+Version 0.3.0
 
-## Phase 2 Complete
+## Phase 3 Complete
 
 ### What This Version Does
 
-Phase 2 adds AI perception and decision-making on top of the Phase 1
-plumbing. The agent can now "see" health bars and on-screen text, build a
-game-state summary, ask a local LLM what to do next, and execute the chosen
-macro — all in a continuous async loop.
+Phase 2 added AI perception and decision-making on top of the Phase 1
+plumbing, and Phase 3 adds persistent memory.  The agent can now "see"
+health bars and on-screen text, build a game-state summary, ask a local
+LLM what to do next, recall past events from a memory database, and
+execute the chosen macro — all in a continuous async loop.
 
 **New in 0.2.0:**
 
@@ -40,9 +41,28 @@ macro — all in a continuous async loop.
 - **Live demo** — an interactive OpenCV window where you can change the
   simulated health bar and watch the agent respond in real time.
 
+**New in 0.3.0:**
+
+- **MCP memory server** — bundled `mcp-memory-service` spawns as a
+  subprocess with health‑check, auto‑restart, and graceful shutdown,
+  providing persistent, queryable memory across sessions.
+- **MCP async client** — `MCPMemoryClient` with local LRU cache (TTL
+  5 s), semantic search via `POST /api/search`, and event storage via
+  `POST /api/memories`.
+- **Memory‑aware decision loop** — before each LLM call the agent
+  queries past memories using the current state summary; after each
+  action the event is stored as a short‑term memory.
+- **Memory summariser** — periodic background task (every N events or
+  5 min) compresses short‑term memories into medium‑term summaries
+  using a secondary LLM call, then deletes the raw events.
+- **Phase 3 integration test & live demo** — full pipeline validation
+  and an interactive OpenCV window that shows MCP operations, memory
+  search results, summariser status, and LLM decisions in real time.
+
 **Phase 1 features** (screen capture, input injection, window auto-focus,
-static macro playback, Ollama health check) are all still available and
-work as before.
+static macro playback, Ollama health check) and **Phase 2 features**
+(colour bar detection, OCR, state processor, LLM decision, adaptive
+frame skipping) are all still available and work as before.
 
 
 ## Installation
@@ -95,6 +115,13 @@ source venv/bin/activate
 python main.py --macro test --ready-delay 3
 ```
 
+### Phase 3 — full memory loop
+
+```bash
+source venv/bin/activate
+python tests/live_demo_phase3.py
+```
+
 ### Phase 2 — continuous decision loop
 
 ```bash
@@ -132,6 +159,43 @@ Controls:
 The window shows detected health/mana percentages, OCR text, the state
 hash, the LLM-chosen action, and the LLM response time.  If Ollama is
 unreachable a warning is shown and LLM calls are skipped.
+
+### Phase 3 Live Demo (memory pipeline)
+
+The Phase 3 demo launches the full memory pipeline — MCP server, Ollama,
+summariser, and decision loop — all running against a synthetic game
+window:
+
+```bash
+source venv/bin/activate
+python tests/live_demo_phase3.py
+```
+
+This demo auto‑starts the bundled MCP memory server, pulls the Ollama
+model if needed, pre‑seeds demo memories, and launches the Memory
+Summariser background task.  A side‑by‑side overlay shows:
+
+- Health/mana, state hash, MCP and Ollama status
+- LLM‑chosen action and response time
+- Recent memory search results
+- Summariser state (events accumulated / threshold)
+- Real‑time MCP operation log
+
+Controls:
+
+| Key | Action |
+|-----|--------|
+| `1` | Set health to 78 % (healthy) |
+| `2` | Set health to 15 % (critical) |
+| `3` | Set health to  5 % (near‑death) |
+| `s` | Force‑store current state + action as memory |
+| `m` | Toggle MemorySummariser on/off |
+| `t` | Trigger an immediate summarisation cycle |
+| `r` | Reset all demo memories (delete + re‑seed) |
+| `q` / `Esc` | Quit |
+
+If the MCP server or Ollama are unreachable the demo degrades
+gracefully with status warnings in the overlay.
 
 
 ## Running Tests

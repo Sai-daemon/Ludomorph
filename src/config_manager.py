@@ -30,6 +30,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ollama_url": "http://localhost:11434/v1",
     "ollama_model": "phi3.5:3.8b-mini-instruct-q4_K_M",
     "mcp_url": "http://localhost:8000",
+    "summarization_model": "phi3.5:mini",
     "memory_max_events": 10000,
     "enable_summarization": True,
     "action_cooldown_ms": 150,

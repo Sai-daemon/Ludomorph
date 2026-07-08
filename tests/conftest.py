@@ -49,6 +49,7 @@ def global_config() -> dict[str, Any]:
         "mcp_url": "http://localhost:8000",
         "memory_max_events": 10000,
         "enable_summarization": True,
+        "summarization_model": "phi3.5:3.8b-mini-instruct-q4_K_M",
         "action_cooldown_ms": 150,
         "diff": {
             "downsample_width": 640,
@@ -195,3 +196,58 @@ def frame_generator():
     from tests.frame_generator import create_simulated_frame
 
     return create_simulated_frame
+
+
+# ---------------------------------------------------------------------------
+# MCP memory helpers (Phase 3.5)
+# ---------------------------------------------------------------------------
+
+
+async def mcp_reachable(config: dict[str, Any] | None = None) -> bool:
+    """Return ``True`` if the MCP memory server is reachable.
+
+    Tries a GET to ``/api/health`` on the URL in *config* (defaults to
+    ``http://localhost:8000``).
+    """
+    import httpx
+
+    base_url = "http://localhost:8000"
+    if config:
+        base_url = config.get("mcp_url", base_url)
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.get(f"{base_url.rstrip('/')}/api/health")
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def ollama_reachable(config: dict[str, Any] | None = None) -> bool:
+    """Return ``True`` if Ollama responds at the configured URL."""
+    import httpx
+
+    url = "http://localhost:11434"
+    if config:
+        url = config.get("ollama_url", url).rstrip("/v1").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=1.5) as client:
+            resp = await client.get(f"{url}/api/tags")
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+@pytest.fixture
+async def mcp_client(global_config: dict[str, Any]):
+    """Return a connected ``MCPMemoryClient``, or ``None`` if the server is unreachable.
+    
+    This is a regular async fixture (not a generator) since it may early‑return
+    ``None`` when the MCP server is down.
+    """
+    if not await mcp_reachable(global_config):
+        return None
+    from src.mcp_client import MCPMemoryClient
+
+    return MCPMemoryClient(
+        base_url=global_config.get("mcp_url", "http://localhost:8000"),
+    )

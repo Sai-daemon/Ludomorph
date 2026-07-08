@@ -162,7 +162,7 @@ def build_llm_prompt(
     if memories:
         memory_lines: list[str] = []
         for mem in memories[:_MAX_MEMORIES]:
-            content = mem.get("content", "")
+            content = mem.get("content", "") if isinstance(mem, dict) else str(mem)
             memory_lines.append(f"- {content[:_MAX_MEMORY_CONTENT_CHARS]}")
         if memory_lines:
             memory_section = "Recent memory:\n" + "\n".join(memory_lines)
