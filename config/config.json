@@ -9,6 +9,8 @@
   "enable_summarization": true,
   "action_cooldown_ms": 150,
   "llm_timeout_ms": 200,
+  "llm_max_tokens": 800,
+  "llm_vision_max_tokens": 1000,
   "diff": {
     "downsample_width": 640,
     "downsample_height": 360,
@@ -29,5 +31,16 @@
   "ocr_cache_ttl_seconds": 2.0,
   "auto_focus_window": true,
   "log_level": "INFO",
-  "input_backend": "auto"
+  "input_backend": "auto",
+  "vision": {
+    "enabled": false,
+    "model_path": "models/yolo11n.onnx",
+    "confidence_threshold": 0.5,
+    "iou_threshold": 0.45,
+    "detection_interval": 5,
+    "max_detections": 20,
+    "roi": null,
+    "backend": "auto",
+    "input_size": 640
+  }
 }

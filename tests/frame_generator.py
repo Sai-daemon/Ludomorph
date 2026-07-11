@@ -97,6 +97,7 @@ def create_simulated_frame(
     mana_fill_hsv: tuple[int, int, int] = (110, 200, 220),  # bright blue
     mana_empty_rgb: tuple[int, int, int] = (20, 20, 20),
     text_color: tuple[int, int, int] = (240, 240, 240),
+    objects: list[dict[str, Any]] | None = None,
 ) -> np.ndarray:
     """Generate a synthetic BGR game frame suitable for testing the full
     perception pipeline.
@@ -183,6 +184,11 @@ def create_simulated_frame(
     _draw_text_region(canvas, OBJ_X1, OBJ_Y1, OBJ_X2, OBJ_Y2,
                       objective_text, text_bgr, font_scale=0.5)
 
+    # ---- Phase 4.5: Draw synthetic game objects for vision detection ----
+    if objects:
+        for obj in objects:
+            _draw_game_object(canvas, obj)
+
     return canvas
 
 
@@ -237,6 +243,55 @@ def _draw_horizontal_bar(
             (x1 - 35, y2 - 6),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_game_object(
+    canvas: np.ndarray,
+    obj: dict[str, Any],
+) -> None:
+    """Draw a synthetic game entity on the canvas for YOLO to detect.
+
+    *obj* is a dict with keys:
+        - x, y (int): top‑left corner
+        - w, h (int): width and height (default 40×40)
+        - color (tuple[int,int,int]): BGR fill colour
+        - label (str): optional text label rendered below the shape
+
+    Typical usage for the Phase 4 live demo:
+        {"x": 350, "y": 120, "w": 50, "h": 60, "color": (0, 0, 255),
+         "label": "enemy"}   → red rectangle (YOLO class "person")
+        {"x": 380, "y": 280, "w": 30, "h": 25, "color": (255, 144, 30),
+         "label": "item"}    → blue-ish rectangle (YOLO class "bottle")
+    """
+    x = int(obj.get("x", 0))
+    y = int(obj.get("y", 0))
+    w = int(obj.get("w", 40))
+    h = int(obj.get("h", 40))
+    color = obj.get("color", (0, 255, 0))
+    label = obj.get("label", "")
+
+    # Clamp to canvas bounds
+    x = max(0, min(x, CANVAS_WIDTH - 1))
+    y = max(0, min(y, CANVAS_HEIGHT - 1))
+    w = max(10, min(w, CANVAS_WIDTH - x))
+    h = max(10, min(h, CANVAS_HEIGHT - y))
+
+    # Draw filled rectangle with a border
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), color, -1)
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), (255, 255, 255), 1)
+
+    # Draw label below the shape
+    if label:
+        cv2.putText(
+            canvas,
+            label,
+            (x, y + h + 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
             (200, 200, 200),
             1,
             cv2.LINE_AA,

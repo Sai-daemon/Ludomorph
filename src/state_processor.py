@@ -33,6 +33,9 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import cv2
@@ -50,6 +53,23 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Dedicated Vision thread pool (§7.7C)
+# ---------------------------------------------------------------------------
+
+VisionExecutor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
+"""Dedicated thread pool for Vision (YOLO) inference.
+
+Must **not** be shared with the TesseractExecutor or GeneralExecutor to
+prevent YOLO inference from blocking input events or file writes.
+"""
+
+
+def shutdown_vision_executor(wait: bool = True) -> None:
+    """Gracefully shut down the dedicated vision thread pool."""
+    VisionExecutor.shutdown(wait=wait)
+
+
+# ---------------------------------------------------------------------------
 # Minimum confidence thresholds for candidate validity
 # ---------------------------------------------------------------------------
 
@@ -61,6 +81,82 @@ _OCR_MIN_CONFIDENCE: float = 0.6
 
 _DEFAULT_OCR_TIMEOUT: float = 0.250
 """Per‑frame aggregate OCR timeout (seconds)."""
+
+# ---------------------------------------------------------------------------
+# Vision-OCR contention thresholds (§7.7A)
+# ---------------------------------------------------------------------------
+
+_OCR_LATENCY_GATE_MS: float = 150.0
+"""If average OCR latency exceeds this (ms), Vision is skipped for the frame."""
+
+_VISION_TIMEOUT_S: float = 0.1
+"""Per‑frame Vision timeout (seconds) — must fit within remaining budget after OCR."""
+
+# ---------------------------------------------------------------------------
+# PipelineMetrics — telemetry for vision-OCR scheduling (§7.7E)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PipelineMetrics:
+    """Lightweight in‑memory telemetry for the decision pipeline.
+
+    Tracks per‑stage latencies and vision‑specific contention counters
+    required by §7.7E of the architecture spec.  Used by both
+    ``StateProcessor`` and the decision loop's adaptive throttling.
+
+    Attributes:
+        ocr_latencies: Ring buffer of recent OCR batch latencies (ms).
+        vision_frames_skipped_due_to_ocr: Counter incremented when vision
+            is skipped because OCR is already slow.
+        vision_timeouts: Counter incremented when vision exceeds the
+            per‑frame timeout.
+        vision_contention_events: Counter for frames where both OCR and
+            Vision attempted to run simultaneously.
+        vision_detection_interval_current: Current vision stagger interval
+            (frames) — may be increased during adaptive throttling.
+        vision_disabled_by_throttle: ``True`` when adaptive throttling has
+            automatically disabled vision.
+    """
+
+    ocr_latencies: list[float] = field(default_factory=list)
+    vision_frames_skipped_due_to_ocr: int = 0
+    vision_timeouts: int = 0
+    vision_contention_events: int = 0
+    vision_detection_interval_current: int = 2
+    vision_disabled_by_throttle: bool = False
+
+    _MAX_LATENCY_SAMPLES: int = field(default=30, repr=False)
+
+    def record_ocr_latency(self, ms: float) -> None:
+        """Append an OCR batch latency sample (ms)."""
+        self.ocr_latencies.append(ms)
+        if len(self.ocr_latencies) > self._MAX_LATENCY_SAMPLES:
+            self.ocr_latencies.pop(0)
+
+    def get_avg_ocr_latency(self) -> float:
+        """Return the mean OCR latency over the recent window, or 0 if empty."""
+        if not self.ocr_latencies:
+            return 0.0
+        return sum(self.ocr_latencies) / len(self.ocr_latencies)
+
+    def record_vision_skip(self) -> None:
+        """Increment the *vision skipped due to OCR* counter."""
+        self.vision_frames_skipped_due_to_ocr += 1
+
+    def record_vision_timeout(self) -> None:
+        """Increment the vision timeout counter."""
+        self.vision_timeouts += 1
+
+    def record_contention(self) -> None:
+        """Increment the contention event counter."""
+        self.vision_contention_events += 1
+
+    def reset_counters(self) -> None:
+        """Reset all counters (but not latency ring buffer)."""
+        self.vision_frames_skipped_due_to_ocr = 0
+        self.vision_timeouts = 0
+        self.vision_contention_events = 0
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +171,8 @@ class StateProcessor:
     ``color_bar`` region (using its calibration dict) and stores
     references to the shared ``OCRModule`` and ``StateSchema``.
 
-    The optional *vision_processor* is a Phase 4 stub — pass ``None``
-    (the default) for now.  When wired it is expected to expose::
+    The optional *vision_processor* is wired during Phase 4 startup
+    (see ``decision_loop.py``).  When provided it must expose::
 
         is_enabled: bool
         async process_frame(frame) -> SpatialContext
@@ -87,13 +183,18 @@ class StateProcessor:
         profile: "RegionProfile",
         ocr_module: OCRModule,
         schema: StateSchema,
-        vision_processor: Any = None,  # Phase 4 stub
+        vision_processor: Any = None,
         cache_ttl: float = 0.3,
+        *,
+        metrics: PipelineMetrics | None = None,
+        vision_interval: int = 2,
     ) -> None:
         self._profile = profile
         self._ocr = ocr_module
         self._schema = schema
         self._cache = StateCache(ttl=cache_ttl)
+        self._metrics = metrics or PipelineMetrics()
+        self._vision_interval = vision_interval
 
         # Build one detector per colour-bar region
         self._colour_detectors: dict[str, ColourBarDetector] = {}
@@ -208,20 +309,78 @@ class StateProcessor:
             else:
                 state.set(slot_name, resolved)
 
-        # 6. Optional vision (Phase 4 stub — every 2nd frame, 80 ms timeout)
-        if (
+        # 6. Vision-OCR scheduling (§7.7 — Phase 4.2)
+        #
+        # OCR always takes absolute priority.  Vision runs concurrently
+        # only when:
+        #   a. A VisionProcessor is wired AND enabled,
+        #   b. The frame counter aligns with the stagger interval,
+        #   c. Average OCR latency is below the 150 ms gate,
+        #   d. Adaptive throttling has not disabled vision.
+        #
+        # Vision runs with a 100 ms timeout; on timeout/cancel the
+        # spatial data is simply omitted for this frame.
+        vision_enabled = (
             self._vision is not None
             and getattr(self._vision, "is_enabled", False)
-            and self.frame_counter % 2 == 0
-        ):
+            and not self._metrics.vision_disabled_by_throttle
+        )
+        vision_interval = self._metrics.vision_detection_interval_current
+
+        vision_task: asyncio.Task[Any] | None = None
+        vision_started: bool = False
+
+        if vision_enabled and (self.frame_counter % vision_interval == 0):
+            avg_ocr = self._metrics.get_avg_ocr_latency()
+            if avg_ocr < _OCR_LATENCY_GATE_MS:
+                # VisionProcessor.process_frame is already async and
+                # offloads heavy ONNX inference to a thread pool internally.
+                vision_task = asyncio.create_task(
+                    self._vision.process_frame(frame)
+                )
+                vision_started = True
+            else:
+                self._metrics.record_vision_skip()
+                logger.debug(
+                    f"Vision skipped — avg OCR latency {avg_ocr:.0f} ms > "
+                    f"{_OCR_LATENCY_GATE_MS:.0f} ms gate"
+                )
+
+        # Record contention if both OCR *and* Vision attempted this frame.
+        # "Attempted" means OCR was not skipped (skip_ocr=False) and
+        # a vision task was created.
+        if not skip_ocr and vision_started:
+            self._metrics.record_contention()
+
+        # If Vision was started, merge results (with timeout).
+        # IMPORTANT: we do this AFTER the existing bar/OCR work so that
+        # Vision never blocks OCR — the task has been running in the
+        # background via the dedicated VisionExecutor thread pool.
+        if vision_task is not None:
             try:
                 spatial = await asyncio.wait_for(
-                    self._vision.process_frame(frame), timeout=0.080
+                    vision_task, timeout=_VISION_TIMEOUT_S
                 )
-                state.set("spatial_context", spatial.context_text)
+                if isinstance(spatial, Exception):
+                    logger.debug(
+                        "Vision processing raised: {}", spatial
+                    )
+                    self._metrics.record_vision_timeout()
+                elif spatial is not None:
+                    # Merge spatial results into GameState
+                    if hasattr(spatial, "context_text"):
+                        state.set("spatial_context", spatial.context_text)
+                    if hasattr(spatial, "detections"):
+                        state.set("detections", spatial.detections)
             except asyncio.TimeoutError:
-                pass
+                vision_task.cancel()
+                self._metrics.record_vision_timeout()
+                logger.debug("Vision processing timed out after {:.0f} ms".format(
+                    _VISION_TIMEOUT_S * 1000
+                ))
             except Exception:
+                vision_task.cancel()
+                self._metrics.record_vision_timeout()
                 logger.debug("Vision processing failed", exc_info=True)
 
         # 7. Phase 2.5 — compute state hash and attach to state
@@ -373,6 +532,9 @@ class StateProcessor:
     ) -> dict[str, OCRResult]:
         """Run all OCR recognitions concurrently with an aggregate timeout.
 
+        Records the batch latency to ``self._metrics`` for the vision-OCR
+        scheduling gate (§7.7A).
+
         If the batch times out, all regions receive ``OCRResult.empty(name)``.
         """
         ocr_regions = self._profile.ocr_regions()
@@ -384,17 +546,23 @@ class StateProcessor:
             for region in ocr_regions
         ]
 
+        _t0 = time.monotonic()
         try:
             results_list = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
+            _elapsed_ms = timeout * 1000
+            self._metrics.record_ocr_latency(_elapsed_ms)
             logger.warning(
-                f"OCR batch timed out after {timeout * 1000:.0f} ms; "
+                f"OCR batch timed out after {_elapsed_ms:.0f} ms; "
                 f"all OCR regions will be empty"
             )
             return {r.name: OCRResult.empty(r.name) for r in ocr_regions}
+        else:
+            _elapsed_ms = (time.monotonic() - _t0) * 1000
+            self._metrics.record_ocr_latency(_elapsed_ms)
 
         output: dict[str, OCRResult] = {}
         for region, result in zip(ocr_regions, results_list):
@@ -496,4 +664,9 @@ class _RawBarSentinel:
 # Module exports
 # ---------------------------------------------------------------------------
 
-__all__ = ["StateProcessor"]
+__all__ = [
+    "StateProcessor",
+    "PipelineMetrics",
+    "VisionExecutor",
+    "shutdown_vision_executor",
+]

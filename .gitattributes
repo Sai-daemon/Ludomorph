@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# YOLO ONNX model — binary, do not attempt text diff/merge
+models/*.onnx binary

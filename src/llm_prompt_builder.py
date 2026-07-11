@@ -1,9 +1,17 @@
 """
-LLM Prompt Builder — Phase 2.6
+LLM Prompt Builder — Phase 2.6 / Phase 4.4
 
 Builds a messages array for the Ollama ``/api/chat`` endpoint from game
 state, available macros, and (stubbed) recent memories, respecting a
-configurable token budget (default 800 tokens).
+configurable token budget (default 800 tokens, raised to 1000 when vision
+is active).
+
+Phase 4.4 extends the builder with:
+- Vision‑aware system prompt (dynamic macro instructions when objects detected)
+- Detection‑to‑macro mapping section (maps detected classes → dynamic macros)
+- Configurable token budgets per mode (``llm_max_tokens`` / ``llm_vision_max_tokens``)
+- ``_DETECTION_GOOD_CLASSES`` filtering to suppress noisy COCO detections
+  (e.g. ``"chair"``, ``"potted plant"``) from the prompt, reducing budget waste.
 
 The prompt builder is a pure, stateless function — no async, no side effects.
 
@@ -17,7 +25,8 @@ Usage::
         available_macros=profile_macros,
         memories=mcp_memories,          # list[dict] | None
         state_schema=schema,
-        max_tokens=800,
+        config=global_config,           # dict with optional llm_* keys
+        vision_enabled=True,
     )
     # messages is a list of dicts suitable for httpx → Ollama /api/chat
     # [
@@ -53,6 +62,39 @@ _MAX_MEMORIES: int = 5
 # Max characters per memory content
 _MAX_MEMORY_CONTENT_CHARS: int = 200
 
+# Default token budgets
+_DEFAULT_MAX_TOKENS: int = 800
+_DEFAULT_VISION_MAX_TOKENS: int = 1000
+
+# Phase 4.4 — COCO classes that are useful for game targeting.
+# Generic objects like "chair", "potted plant" produce too much noise
+# in the prompt.  Only keep classes that are plausible as game entities.
+_DETECTION_GOOD_CLASSES: frozenset[str] = frozenset({
+    "person", "bicycle", "car", "motorcycle", "bus", "train", "truck",
+    "boat", "airplane",
+    "traffic light", "fire hydrant", "stop sign",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant",
+    "bear", "zebra", "giraffe",
+    "backpack", "umbrella", "handbag", "tie", "suitcase",
+    "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl",
+    "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
+    "hot dog", "pizza", "donut", "cake",
+    "laptop", "mouse", "remote", "keyboard", "cell phone",
+    "book", "clock", "vase", "scissors", "teddy bear",
+    "tv", "microwave", "oven", "toaster", "sink", "refrigerator",
+    "bed", "dining table", "toilet",
+    "hair drier", "toothbrush",
+})
+"""Subset of COCO classes that are worth mentioning to the LLM.
+
+Excludes overly generic scenery classes (``"potted plant"``, ``"chair"``,
+``"couch"``, ``"parking meter"``, ``"bench"``) that rarely represent
+interactive game objects and waste token budget.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Public: token counting
@@ -77,7 +119,10 @@ def build_llm_prompt(
     available_macros: list[dict[str, Any]],
     memories: list[dict[str, Any]] | None = None,
     state_schema: "StateSchema | None" = None,
-    max_tokens: int = 800,
+    max_tokens: int | None = None,
+    *,
+    config: dict[str, Any] | None = None,
+    vision_enabled: bool = False,
 ) -> list[dict[str, str]]:
     """Create a message list for the Ollama ``/api/chat`` endpoint.
 
@@ -85,6 +130,13 @@ def build_llm_prompt(
     return a JSON object with an ``"action"`` field.  The user message
     combines game state, spatial context, available macros, and recent
     memories — all within the token budget.
+
+    Phase 4.4: When *vision_enabled* is ``True`` the system prompt is
+    extended with dynamic‑macro targeting instructions, a
+    detection‑to‑macro mapping section is injected (priority 0), and the
+    token budget is raised to ``llm_vision_max_tokens`` from *config*
+    (default 1000).  Detection results are filtered through
+    ``_DETECTION_GOOD_CLASSES`` to suppress noisy COCO classes.
 
     Args:
         state: Populated ``GameState`` from ``StateProcessor.process()``.
@@ -94,8 +146,15 @@ def build_llm_prompt(
             Pass ``None`` or ``[]`` for the Phase 2 stub.
         state_schema: Optional ``StateSchema``; if ``None``, derived from
             ``state.schema``.
-        max_tokens: Maximum total tokens for the assembled message
-            (system + user combined).
+        max_tokens: Override for the token budget.  When ``None`` (the
+            default) the budget is determined from *config*:
+            ``llm_vision_max_tokens`` if *vision_enabled*, else
+            ``llm_max_tokens``, else :data:`_DEFAULT_MAX_TOKENS`.
+        config: Global config dict (Phase 1.1) containing optional
+            ``llm_max_tokens`` and ``llm_vision_max_tokens`` keys.
+        vision_enabled: If ``True``, the system prompt gains dynamic
+            macro targeting instructions and a detection‑mapping section
+            is added.
 
     Returns:
         A list of message dicts suitable for Ollama ``/api/chat``:
@@ -107,18 +166,45 @@ def build_llm_prompt(
     # Resolve schema
     schema = state_schema if state_schema is not None else state.schema
 
+    # Resolve token budget from config or defaults
+    if max_tokens is None:
+        if config is not None:
+            if vision_enabled:
+                max_tokens = config.get("llm_vision_max_tokens", _DEFAULT_VISION_MAX_TOKENS)
+            else:
+                max_tokens = config.get("llm_max_tokens", _DEFAULT_MAX_TOKENS)
+        else:
+            max_tokens = _DEFAULT_VISION_MAX_TOKENS if vision_enabled else _DEFAULT_MAX_TOKENS
+
     # Serialize state to a plain dict for section building
     state_dict = _build_state_dict(state, schema)
+
+    # Extract vision detections (if any) for Phase 4.4 sections
+    detections: list[Any] = _normalise_detections(state.get("detections"))
 
     # ------------------------------------------------------------------
     # System prompt
     # ------------------------------------------------------------------
     macro_names = [m["name"] for m in available_macros] if available_macros else ["WAIT"]
-    system_prompt = (
-        "You are a game AI agent. Respond ONLY with a JSON object containing "
-        f"an \"action\" field from: {', '.join(macro_names)}.\n"
-        "No extra words, no explanations."
-    )
+
+    if vision_enabled and detections:
+        # Phase 4.4 — vision‑aware system prompt: tell the LLM it can
+        # target detected objects via dynamic macros.
+        system_prompt = (
+            "You are a game AI agent. Respond ONLY with a JSON object containing "
+            f"an \"action\" field from: {', '.join(macro_names)}.\n"
+            "If a targetable object is detected, you may use a dynamic macro "
+            "that targets that object (e.g. \"dynamic_click\" with the object's "
+            "class name).  Prefer static macros when no target is needed.\n"
+            "No extra words, no explanations."
+        )
+    else:
+        system_prompt = (
+            "You are a game AI agent. Respond ONLY with a JSON object containing "
+            f"an \"action\" field from: {', '.join(macro_names)}.\n"
+            "No extra words, no explanations."
+        )
+
     system_tokens = count_tokens(system_prompt)
     remaining_tokens = max_tokens - system_tokens
 
@@ -145,7 +231,13 @@ def build_llm_prompt(
     if spatial and isinstance(spatial, str) and spatial.strip():
         sections.append((0, spatial))
 
-    # 3. Available macros (priority 0)
+    # 3. Phase 4.4 — detection‑to‑macro mapping (priority 0)
+    if vision_enabled and detections:
+        mapping = _build_detection_macro_mapping(detections, available_macros)
+        if mapping:
+            sections.append((0, mapping))
+
+    # 4. Available macros (priority 0)
     if available_macros:
         macro_lines = []
         for m in available_macros:
@@ -158,7 +250,7 @@ def build_llm_prompt(
         macro_section = "Available Macros:\n" + "\n".join(macro_lines)
         sections.append((0, macro_section))
 
-    # 4. Recent memories (priority 1 — trimmable)
+    # 5. Recent memories (priority 1 — trimmable)
     if memories:
         memory_lines: list[str] = []
         for mem in memories[:_MAX_MEMORIES]:
@@ -231,6 +323,8 @@ def _build_state_dict(state: "GameState", schema: "StateSchema") -> dict[str, An
             continue  # already handled
         if key == "spatial_context":
             continue  # handled separately in build_llm_prompt
+        if key == "detections":
+            continue  # handled separately via _build_detection_macro_mapping
         if key.startswith("_"):
             continue  # internal metadata (e.g. _state_hash)
         if any(key.endswith(suffix) for suffix in _SKIP_KEY_SUFFIXES):
@@ -256,7 +350,95 @@ def _is_serialisable_for_prompt(value: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Phase 4.4 — Detection helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalise_detections(raw: Any) -> list[Any]:
+    """Safely extract a flat list of detection objects from *raw*.
+
+    Accepts ``None``, an empty list, a single ``Detection``, a
+    ``SpatialContext``, or any iterable.  Returns a plain ``list`` of
+    detection‑like objects (each expected to have ``class_name`` and
+    ``confidence`` attributes).
+    """
+    if raw is None:
+        return []
+
+    if isinstance(raw, list):
+        return raw
+
+    # Single detection object
+    if hasattr(raw, "class_name") and hasattr(raw, "confidence"):
+        return [raw]
+
+    # SpatialContext or similar aggregate
+    if hasattr(raw, "detections"):
+        return list(raw.detections) if raw.detections else []
+
+    return []
+
+
+def _build_detection_macro_mapping(
+    detections: list[Any],
+    available_macros: list[dict[str, Any]],
+) -> str | None:
+    """Build a detection‑to‑macro mapping section for the LLM prompt.
+
+    For each unique detected class name that also appears as a
+    ``target_class`` in a dynamic macro step, produce a line like::
+
+        - person → can be targeted with: DYNAMIC_CLICK
+
+    Noisy COCO classes that are not in :data:`_DETECTION_GOOD_CLASSES`
+    are silently dropped.
+
+    Returns ``None`` if no useful mappings exist (i.e. no detections
+    match any dynamic macro target class).
+    """
+    # 1. Collect all target_class values from dynamic macros
+    dynamic_targets: dict[str, list[str]] = {}  # target_class → [macro_name, ...]
+    for macro in available_macros:
+        steps = macro.get("actions", macro.get("steps", []))
+        for step in steps:
+            step_type = step.get("type", "") if isinstance(step, dict) else ""
+            if isinstance(step_type, str) and step_type.startswith("dynamic_"):
+                target = step.get("target_class", "")
+                if target:
+                    dynamic_targets.setdefault(target, []).append(macro["name"])
+
+    if not dynamic_targets:
+        return None
+
+    # 2. Map detected classes → available dynamic macros
+    seen: set[str] = set()
+    mappings: list[str] = []
+    for det in detections:
+        cls_name = getattr(det, "class_name", None)
+        if cls_name is None or cls_name in seen:
+            continue
+        # Filter noisy COCO classes
+        if cls_name not in _DETECTION_GOOD_CLASSES:
+            continue
+        if cls_name in dynamic_targets:
+            seen.add(cls_name)
+            macro_list = ", ".join(sorted(set(dynamic_targets[cls_name])))
+            mappings.append(f"- {cls_name} → can be targeted with: {macro_list}")
+
+    if not mappings:
+        return None
+
+    return "Targetable objects:\n" + "\n".join(mappings)
+
+
+# ---------------------------------------------------------------------------
 # Module exports
 # ---------------------------------------------------------------------------
 
-__all__ = ["build_llm_prompt", "count_tokens"]
+__all__ = [
+    "build_llm_prompt",
+    "count_tokens",
+    "_DETECTION_GOOD_CLASSES",
+    "_normalise_detections",
+    "_build_detection_macro_mapping",
+]

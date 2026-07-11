@@ -71,7 +71,12 @@ from src.ocr_module import (
 # Phase 2.4 — State Processor
 # ---------------------------------------------------------------------------
 
-from src.state_processor import StateProcessor
+from src.state_processor import (
+    PipelineMetrics,
+    StateProcessor,
+    VisionExecutor,
+    shutdown_vision_executor,
+)
 
 # ---------------------------------------------------------------------------
 # Phase 2.5 — State Hashing & Caching
@@ -127,6 +132,9 @@ __all__ = [
     "shutdown_ocr_executor",
     # Phase 2.4
     "StateProcessor",
+    "PipelineMetrics",
+    "VisionExecutor",
+    "shutdown_vision_executor",
     # Phase 2.5
     "state_hash",
     "StateCache",

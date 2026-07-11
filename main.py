@@ -39,6 +39,7 @@ from src.screen_capture import ScreenCapture, CaptureConfig, WindowTracker
 from src.macro_executor import MacroExecutor, MacroRequest, MacroPriority
 from src.ollama_health import ollama_health_check
 from src.mcp_server import MCPServerManager
+from src.vision_detector import VisionProcessor, VisionConfig
 
 logger = get_logger(__name__)
 
@@ -470,11 +471,46 @@ async def _phase2_main(
     # ------------------------------------------------------------------
     from src.state_processor import StateProcessor
 
+    # --- Phase 4.1: Optionally wire up the vision processor ---
+    vision_processor: Any = None
+    vision_cfg = config.get("vision", {})
+    if vision_cfg.get("enabled", False):
+        # Resolve model path relative to project root if not absolute
+        model_path_str = vision_cfg.get("model_path", "models/yolo11n.onnx")
+        model_path = Path(model_path_str)
+        if not model_path.is_absolute():
+            model_path = _PROJECT_ROOT / model_path_str
+
+        try:
+            vconfig = VisionConfig.from_dict(vision_cfg)
+            vconfig.model_path = str(model_path)
+
+            # Determine screen size from capture (or use a default)
+            screen_w, screen_h = 1920, 1080
+            if test_frame is not None:
+                h, w = test_frame.shape[:2]
+                screen_w, screen_h = w, h
+
+            vision_processor = VisionProcessor(vconfig, screen_size=(screen_w, screen_h))
+            logger.info(
+                "Vision processor enabled (model=%s, input=%d, detect_every=%d frames)",
+                model_path,
+                vconfig.input_size,
+                vconfig.detection_interval,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Vision processor failed to initialise: %s — "
+                "vision disabled for this session.",
+                exc,
+            )
+            vision_processor = None
+
     state_processor = StateProcessor(
         profile=profile,
         ocr_module=ocr,
         schema=schema,
-        vision_processor=None,  # Phase 4 stub
+        vision_processor=vision_processor,
         cache_ttl=config.get("state_cache_ttl_seconds", 0.3),
     )
     logger.info("StateProcessor initialised.")

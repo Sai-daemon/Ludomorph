@@ -4,17 +4,20 @@ Have a local LLM play your game, in realish time.
 
 Currently a work in progress.
 
-Version 0.3.0
+Version 0.4.0
 
-## Phase 3 Complete
+## Phase 4 Complete
 
 ### What This Version Does
 
 Phase 2 added AI perception and decision-making on top of the Phase 1
-plumbing, and Phase 3 adds persistent memory.  The agent can now "see"
-health bars and on-screen text, build a game-state summary, ask a local
-LLM what to do next, recall past events from a memory database, and
-execute the chosen macro — all in a continuous async loop.
+plumbing, Phase 3 added persistent memory, and Phase 4 adds spatial
+vision.  The agent can now "see" health bars, on-screen text, **and**
+objects (enemies, items, NPCs) via YOLO object detection, build a
+spatially-aware game-state summary, ask a local LLM what to do next,
+resolve dynamic macros to concrete screen coordinates, recall past
+events from a memory database, and execute the chosen macro — all in a
+continuous async loop.
 
 **New in 0.2.0:**
 
@@ -59,10 +62,42 @@ execute the chosen macro — all in a continuous async loop.
   and an interactive OpenCV window that shows MCP operations, memory
   search results, summariser status, and LLM decisions in real time.
 
+**New in 0.4.0:**
+
+- **YOLO object detection** — ONNX-based detector (`yolo11n.onnx`) with
+  COCO 80-class recognition, bounding boxes, confidence scoring, and
+  centre‑point targeting; inference runs in a dedicated thread pool to
+  avoid blocking the async event loop.
+- **Optical flow tracker** — lightweight Lucas‑Kanade optical flow
+  bridges gaps between detection frames, maintaining persistent
+  tracked IDs across consecutive frames without re‑running inference.
+- **Spatial context builder** — converts raw detections into
+  human‑readable text (`"person detected at centre‑middle"`) that is
+  injected into the LLM prompt, giving the agent spatial awareness.
+- **Vision‑OCR scheduling** — strict scheduling rules prevent overlap:
+  OCR always has priority, vision runs at staggered intervals with
+  configurable latency gates and contention tracking.
+- **Dynamic macro resolver** — `MacroResolver` converts `dynamic_attack`
+  and `dynamic_collect` macro steps into concrete `mouse_move` +
+  `click` coordinates using real‑time detections, with
+  nearest‑to‑centre target selection.
+- **Vision‑aware LLM prompts** — extended `build_llm_prompt()` appends
+  spatial context text and a dynamic JSON macro schema so the LLM can
+  request object‑targeted actions.
+- **Phase 4 integration test** — synthetic game window with drawn
+  enemies and potions validates the full vision pipeline: detection →
+  spatial context → dynamic macro resolution → LLM decision
+  end‑to‑end.
+- **Phase 4 Live Demo** — interactive OpenCV window with YOLO overlay,
+  targeting reticles, vision status panel, MCP memory, summariser,
+  and all vision controls in real time.
+
 **Phase 1 features** (screen capture, input injection, window auto-focus,
-static macro playback, Ollama health check) and **Phase 2 features**
+static macro playback, Ollama health check), **Phase 2 features**
 (colour bar detection, OCR, state processor, LLM decision, adaptive
-frame skipping) are all still available and work as before.
+frame skipping), and **Phase 3 features** (MCP memory server, memory
+client, memory‑aware decision loop, summariser) are all still available
+and work as before.
 
 
 ## Installation
@@ -196,6 +231,51 @@ Controls:
 
 If the MCP server or Ollama are unreachable the demo degrades
 gracefully with status warnings in the overlay.
+
+### Phase 4 Live Demo (vision pipeline)
+
+The Phase 4 demo launches the full vision pipeline — YOLO object
+detector, optical flow tracker, spatial context builder, MCP memory
+server, Ollama, summariser, and decision loop — all running against a
+synthetic game window:
+
+```bash
+source venv/bin/activate
+python tests/live_demo_phase4.py
+```
+
+This demo auto‑loads the YOLO ONNX model (`models/yolo11n.onnx`),
+starts the bundled MCP memory server, pre‑warms ONNX embeddings, pulls
+the Ollama model if needed, and launches all Phase 4 subsystems.  The
+overlay shows:
+
+- Health/mana bars, state hash, MCP and Ollama status
+- LLM‑chosen action (including dynamic macro resolution), response time
+- YOLO detection overlay with bounding boxes and labels
+- Targeting reticles on detected objects
+- Vision status panel (detections, scheduler latency, tracking IDs)
+- Memory search results and summariser state
+- Real‑time MCP operation log
+
+Controls:
+
+| Key | Action |
+|-----|--------|
+| `1` | Set health to 78 % (healthy) |
+| `2` | Set health to 15 % (critical) |
+| `3` | Set health to  5 % (near‑death) |
+| `e` | Spawn enemy (red rect, simulated ``person`` class) |
+| `p` | Spawn potion (blue rect, simulated ``bottle`` class) |
+| `c` | Clear all spawned objects |
+| `s` | Force‑store current state + action as memory |
+| `m` | Toggle MemorySummariser on/off |
+| `t` | Trigger an immediate summarisation cycle |
+| `r` | Reset all demo memories (delete + re‑seed) |
+| `q` / ``Esc`` | Quit |
+
+If vision fails to load (missing ONNX model or onnxruntime), the demo
+degrades gracefully — health bars, OCR, LLM, and memory all continue
+while vision is simply skipped.
 
 
 ## Running Tests

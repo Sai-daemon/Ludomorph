@@ -28,6 +28,20 @@
       "actions": [
         {"type": "key", "key": "a", "hold_ms": 100}
       ]
+    },
+    {
+      "name": "DYNAMIC_CLICK_ENEMY",
+      "description": "Click on a detected enemy (person class)",
+      "actions": [
+        {"type": "dynamic_click", "target_class": "person", "button": "left"}
+      ]
+    },
+    {
+      "name": "DYNAMIC_CLICK_ITEM",
+      "description": "Right-click on a detected item (bottle class)",
+      "actions": [
+        {"type": "dynamic_click", "target_class": "bottle", "button": "right"}
+      ]
     }
   ]
 }

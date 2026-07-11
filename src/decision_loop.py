@@ -57,6 +57,7 @@ from src.llm_decision import call_llm_decision
 from src.llm_prompt_builder import build_llm_prompt
 from src.logging_config import get_logger
 from src.macro_executor import MacroExecutor, MacroPriority, MacroRequest
+from src.macro_resolver import MacroResolver
 
 logger = get_logger(__name__)
 
@@ -80,7 +81,20 @@ _LATENCY_HIGH_WATERMARK_MS: float = 500.0
 """Per‑cycle latency (ms) above which the counter increments."""
 
 _LATENCY_SPIKE_COUNT: int = 3
-"""Consecutive high‑latency cycles before throttling engages."""
+"""Consecutive high‑latency cycles before general throttling engages."""
+
+_VISION_REDUCE_COUNT: int = 3
+"""Consecutive high‑latency cycles before vision detection interval is
+reduced (every 10th frame) and YOLO input size drops to 320."""
+
+_VISION_DISABLE_COUNT: int = 5
+"""Consecutive high‑latency cycles before vision is completely disabled."""
+
+_VISION_REDUCED_INTERVAL: int = 10
+"""Vision stagger interval when latency is high (§7.7D rule 1)."""
+
+_VISION_REDUCED_INPUT_SIZE: int = 320
+"""YOLO input size when latency is high (§7.7D rule 2)."""
 
 # ---------------------------------------------------------------------------
 # ThrottleState
@@ -92,7 +106,9 @@ class ThrottleState:
 
     When the decision loop consistently exceeds 500 ms per cycle,
     throttling engages: OCR alternation, reduced LLM context, and
-    longer capture intervals lower CPU/GPU pressure.
+    longer capture intervals lower CPU/GPU pressure.  Vision-specific
+    throttling (§7.7D) reduces or disables vision when pipeline
+    latency remains high.
 
     Attributes:
         active: ``True`` when throttling is engaged.
@@ -102,6 +118,12 @@ class ThrottleState:
             halved (800 → 400 tokens) and context size is reduced.
         capture_interval: Seconds between capture frames.  Normal is
             50 ms; throttled is 100 ms.
+        vision_disable: ``True`` when vision should be completely
+            disabled by adaptive throttling.
+        vision_interval_override: Non‑``None`` overrides the default
+            vision stagger interval (e.g., 10 for every 10th frame).
+        vision_input_size_override: Non‑``None`` overrides YOLO input
+            size to a reduced resolution (e.g., 320 instead of 640).
     """
 
     __slots__ = (
@@ -109,6 +131,9 @@ class ThrottleState:
         "skip_ocr_alternate",
         "reduce_llm_context",
         "capture_interval",
+        "vision_disable",
+        "vision_interval_override",
+        "vision_input_size_override",
     )
 
     def __init__(self) -> None:
@@ -116,6 +141,9 @@ class ThrottleState:
         self.skip_ocr_alternate: bool = False
         self.reduce_llm_context: bool = False
         self.capture_interval: float = 0.05  # 50 ms normal
+        self.vision_disable: bool = False
+        self.vision_interval_override: int | None = None
+        self.vision_input_size_override: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +198,30 @@ def build_memory_query(state: Any) -> str:
             break
 
     return " ".join(parts) if parts else "game state"
+
+
+def _sync_vision_throttle_to_metrics(state_processor: Any, throttle: ThrottleState) -> None:
+    """Mirror ``ThrottleState`` vision fields into the ``PipelineMetrics``
+    object owned by *state_processor*.
+
+    The ``StateProcessor`` schedules vision based on ``PipelineMetrics``
+    fields (§7.7F), so any throttle‑driven changes must be pushed into
+    that shared object.
+    """
+    try:
+        state_processor._metrics.vision_disabled_by_throttle = throttle.vision_disable
+        state_processor._metrics.vision_detection_interval_current = (
+            throttle.vision_interval_override or 2
+        )
+        # Apply input size override to the VisionProcessor's config if possible
+        _vp = getattr(state_processor, "_vision", None)
+        if _vp is not None and hasattr(_vp, "config"):
+            if throttle.vision_input_size_override is not None:
+                _vp.config.input_size = throttle.vision_input_size_override
+            else:
+                _vp.config.input_size = _vp.config.input_size  # keep current
+    except AttributeError:
+        pass
 
 
 def check_high_priority_event(
@@ -477,15 +529,31 @@ async def decision_loop(
                 # ------------------------------------------------------
                 # 7. Build LLM prompt
                 # ------------------------------------------------------
+                # Phase 4.4 — pass config and vision status so the
+                # prompt builder can inject spatial context and use the
+                # vision‑adjusted token budget.
                 context_reduction = (
                     throttle.active and throttle.reduce_llm_context
                 )
                 max_tokens = 800 if not context_reduction else 400
+                # Determine if vision is active this cycle
+                _vision_wired_chk = (
+                    getattr(state_processor, "_vision", None) is not None
+                )
+                _vision_enabled_chk = (
+                    _vision_wired_chk
+                    and getattr(state_processor._vision, "is_enabled", False)
+                    if _vision_wired_chk
+                    else False
+                )
+
                 messages = build_llm_prompt(
                     state=state,
                     available_macros=profile_macros,
                     memories=memories,
                     max_tokens=max_tokens,
+                    config=config,
+                    vision_enabled=_vision_enabled_chk,
                 )
 
                 # ------------------------------------------------------
@@ -516,10 +584,38 @@ async def decision_loop(
                 steps = macro_def.get(
                     "actions", macro_def.get("steps", [])
                 )
+                # --- Phase 4.3: resolve dynamic steps via vision detections ---
                 if steps:
+                    detections = None
+                    if hasattr(state, "get"):
+                        detections = state.get("detections")
+                    screen_w, screen_h = frame.shape[1], frame.shape[0]
+                    resolver = MacroResolver(
+                        detections=detections,
+                        screen_size=(screen_w, screen_h),
+                    )
+                    resolved_steps = resolver.resolve_all(steps)
+
+                    if not resolved_steps:
+                        logger.debug(
+                            "All macro steps for {!r} were skipped "
+                            "(targets not detected); macro not executed.",
+                            action,
+                        )
+                        # Skip to the next loop iteration — do not
+                        # execute an empty macro.
+                        last_state = state
+                        last_action = action
+                        frame_counter += 1
+                        cycle_start = time.monotonic()
+                        continue
+                else:
+                    resolved_steps = steps
+
+                if resolved_steps:
                     request = MacroRequest(
                         name=action,
-                        actions=steps,
+                        actions=resolved_steps,
                         priority=MacroPriority.NORMAL,
                     )
                     try:
@@ -586,7 +682,7 @@ async def decision_loop(
                 asyncio.create_task(_store_and_log())
 
             # ----------------------------------------------------------
-            # 11. Latency monitoring & adaptive throttling
+            # 11. Latency monitoring & adaptive throttling (§7.6, §7.7D)
             # ----------------------------------------------------------
             cycle_elapsed_ms = (
                 time.monotonic() - cycle_start
@@ -599,7 +695,20 @@ async def decision_loop(
                 high_latency_count += 1
             else:
                 high_latency_count = 0
+                # Reset vision throttling when latency recovers
+                if throttle.vision_disable and not throttle.active:
+                    throttle.vision_disable = False
+                    throttle.vision_interval_override = None
+                    throttle.vision_input_size_override = None
+                    # Sync to PipelineMetrics
+                    try:
+                        state_processor._metrics.vision_disabled_by_throttle = False
+                        state_processor._metrics.vision_detection_interval_current = 2
+                    except AttributeError:
+                        pass
+                    logger.info("Vision throttling disengaged — latency recovered.")
 
+            # --- General throttling (§7.6) ---
             if high_latency_count >= _LATENCY_SPIKE_COUNT:
                 if not throttle.active:
                     logger.warning(
@@ -620,6 +729,56 @@ async def decision_loop(
                 throttle.skip_ocr_alternate = False
                 throttle.reduce_llm_context = False
                 throttle.capture_interval = 0.05
+
+            # --- Vision-specific adaptive throttling (§7.7D) ---
+            #
+            # Only applies when vision is actually wired and enabled.
+            # Uses the same high_latency_count tracked above.
+            _vision_wired = getattr(state_processor, "_vision", None) is not None
+            _vision_enabled = (
+                _vision_wired
+                and getattr(state_processor._vision, "is_enabled", False)
+                if _vision_wired
+                else False
+            )
+
+            if _vision_enabled:
+                if high_latency_count >= _VISION_DISABLE_COUNT:
+                    # §7.7D rule 3: disable vision entirely
+                    if not throttle.vision_disable:
+                        logger.warning(
+                            "Pipeline latency > 500 ms for {} consecutive cycles — "
+                            "automatically DISABLING Vision module.  Restart or "
+                            "manual re‑enable required.",
+                            high_latency_count,
+                        )
+                    throttle.vision_disable = True
+                    throttle.vision_interval_override = None
+                    throttle.vision_input_size_override = None
+                    _sync_vision_throttle_to_metrics(state_processor, throttle)
+
+                elif high_latency_count >= _VISION_REDUCE_COUNT:
+                    # §7.7D rule 1 & 2: reduce frequency and input size
+                    if throttle.vision_interval_override != _VISION_REDUCED_INTERVAL:
+                        logger.warning(
+                            "Pipeline latency > 500 ms for {} consecutive cycles — "
+                            "reducing Vision detection to every {} frames and "
+                            "input size to {}×{}.",
+                            high_latency_count,
+                            _VISION_REDUCED_INTERVAL,
+                            _VISION_REDUCED_INPUT_SIZE,
+                            _VISION_REDUCED_INPUT_SIZE,
+                        )
+                    throttle.vision_disable = False
+                    throttle.vision_interval_override = _VISION_REDUCED_INTERVAL
+                    throttle.vision_input_size_override = _VISION_REDUCED_INPUT_SIZE
+                    _sync_vision_throttle_to_metrics(state_processor, throttle)
+                else:
+                    # Below 3 — no vision throttling needed
+                    if throttle.vision_interval_override is not None:
+                        throttle.vision_interval_override = None
+                        throttle.vision_input_size_override = None
+                        _sync_vision_throttle_to_metrics(state_processor, throttle)
 
             # --- Advance loop state ---
             last_state = state
@@ -650,6 +809,7 @@ __all__ = [
     "decision_loop",
     "capture_producer",
     "ThrottleState",
+    "_sync_vision_throttle_to_metrics",
     "find_macro_by_name",
     "build_memory_query",
     "check_high_priority_event",

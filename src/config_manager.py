@@ -55,6 +55,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_focus_window": True,
     "log_level": "INFO",
     "input_backend": "auto",
+    "vision": {
+        "enabled": False,
+        "model_path": "models/yolo11n.onnx",
+        "confidence_threshold": 0.5,
+        "iou_threshold": 0.45,
+        "detection_interval": 5,
+        "max_detections": 20,
+        "roi": None,
+        "backend": "auto",
+        "input_size": 640,
+    },
 }
 
 DEFAULT_MACROS: list[dict[str, Any]] = []
