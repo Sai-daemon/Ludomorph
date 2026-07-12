@@ -137,6 +137,12 @@ def main() -> None:
         help="Name of the game profile to use for the decision loop "
         "(Phase 2). Must exist under ~/.gameai/profiles/<name>/.",
     )
+    parser.add_argument(
+        "--gui",
+        dest="launch_gui",
+        action="store_true",
+        help="Launch the Tkinter GUI instead of the CLI (Phase 5).",
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
@@ -226,9 +232,13 @@ def main() -> None:
         logger.info("MCP memory server disabled in config (mcp_enabled=false).")
 
     # ------------------------------------------------------------------
-    # 7. Dispatch to Phase 1 or Phase 2 based on CLI flags.
+    # 7. Dispatch: GUI, Phase 2, or Phase 1 based on CLI flags.
     # ------------------------------------------------------------------
-    if args.decision_loop:
+    if args.launch_gui:
+        logger.info("--- Launching GUI (Phase 5) ---")
+        from src.gui import launch_gui
+        launch_gui()
+    elif args.decision_loop:
         logger.info("--- Phase 2 Decision Loop ---")
         asyncio.run(_phase2_main(config, input_ctrl, args, mcp_manager))
     else:

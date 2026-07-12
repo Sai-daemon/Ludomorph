@@ -4,101 +4,53 @@ Have a local LLM play your game, in realish time.
 
 Currently a work in progress.
 
-Version 0.4.0
+Version 0.5.0
 
-## Phase 4 Complete
+## Phase 5 Complete
 
 ### What This Version Does
 
-Phase 2 added AI perception and decision-making on top of the Phase 1
-plumbing, Phase 3 added persistent memory, and Phase 4 adds spatial
-vision.  The agent can now "see" health bars, on-screen text, **and**
-objects (enemies, items, NPCs) via YOLO object detection, build a
-spatially-aware game-state summary, ask a local LLM what to do next,
-resolve dynamic macros to concrete screen coordinates, recall past
-events from a memory database, and execute the chosen macro — all in a
-continuous async loop.
+Phase 5 delivers a standalone desktop application with a full Tkinter GUI,
+region calibration overlay, colour‑bar capture, macro editor, settings
+panel, health monitor, profile manager, and end‑to‑end testing.  The app
+launches via `python main.py --gui` and provides everything needed to
+create game profiles without editing JSON by hand.
 
-**New in 0.2.0:**
+**New in 0.5.0:**
 
-- **Colour bar detection** — reads health, mana, and similar status bars
-  from the screen using HSV thresholding and projection analysis.
-- **OCR text reading** — extracts location names, objective text, and
-  numeric readouts via Tesseract with preprocessing and caching.
-- **Game state model** — typed `GameState` container with a user-extensible
-  JSON schema (`state_schema.json`).
-- **Region profiles** — screen regions mapped to state slots via
-  `regions.json` with `color_bar` or `ocr` types and a `role` field.
-- **State hashing & caching** — salted SHA-256 hash of game state with a
-  0.3 s TTL, avoiding duplicate LLM calls on static frames.
-- **LLM prompt builder & decision call** — assembles a token-budgeted
-  prompt, sends it to Ollama's `/api/chat`, parses the JSON response,
-  and falls back gracefully on timeouts.
-- **Adaptive frame skipping** — pixel-diff detector that skips processing
-  when the screen is static, saving CPU and LLM calls.
-- **Decision loop** — wires everything together: capture → skip? →
-  process state → cache? → LLM → execute macro, with latency monitoring
-  and adaptive throttling.
-- **Integration tests** — synthetic game frames with colour bars and OCR
-  text validate the full pipeline end‑to‑end.
-- **Live demo** — an interactive OpenCV window where you can change the
-  simulated health bar and watch the agent respond in real time.
+- **Tkinter shell & async bridge** — `AsyncTk` event‑loop bridge,
+  real‑time `LogDashboard` sink for loguru, Start/Stop/Pause controls,
+  and colour‑coded status bar.
+- **Region calibration overlay** — transparent full‑screen window with
+  click‑and‑drag bounding boxes, role/type assignment, and live OCR
+  preview.
+- **Colour‑bar calibration capture** — "Capture Empty/Full" buttons
+  grab live frames through the overlay, auto‑compute HSV thresholds,
+  preview mask visualisation, and bar‑type/orientation dropdowns.
+- **Macro JSON editor** — syntax‑highlighted editor with add/delete/
+  refresh actions.
+- **Settings panel** — tabbed configuration for Ollama URL, model, MCP
+  toggle, vision toggle, input backend, and more.
+- **Health Monitor panel** — per‑component status display (Ollama,
+  Tesseract, MCP, game window) with actionable error messages and
+  colour‑coded indicators.
+- **Profile manager** — import/export `.gameai_profile` zip archives
+  with full 8‑point validation (manifest, required files, valid JSON,
+  action types, region bounds, icon, paths, encoding).
+- **End‑to‑end tests** — 208 passing tests across 6 suites covering
+  calibration, macros, settings, health, profiles, and full agent
+  pipeline integration.
 
-**New in 0.3.0:**
+## Phase History
 
-- **MCP memory server** — bundled `mcp-memory-service` spawns as a
-  subprocess with health‑check, auto‑restart, and graceful shutdown,
-  providing persistent, queryable memory across sessions.
-- **MCP async client** — `MCPMemoryClient` with local LRU cache (TTL
-  5 s), semantic search via `POST /api/search`, and event storage via
-  `POST /api/memories`.
-- **Memory‑aware decision loop** — before each LLM call the agent
-  queries past memories using the current state summary; after each
-  action the event is stored as a short‑term memory.
-- **Memory summariser** — periodic background task (every N events or
-  5 min) compresses short‑term memories into medium‑term summaries
-  using a secondary LLM call, then deletes the raw events.
-- **Phase 3 integration test & live demo** — full pipeline validation
-  and an interactive OpenCV window that shows MCP operations, memory
-  search results, summariser status, and LLM decisions in real time.
+| Phase | Version | Key Features |
+|-------|---------|-------------|
+| 1 | 0.1.0 | Screen capture, input injection, static macro playback, window auto‑focus, Ollama health check |
+| 2 | 0.2.0 | Colour‑bar detection, OCR text reading, game‑state model, LLM decision loop, adaptive frame skipping |
+| 3 | 0.3.0 | Bundled MCP memory server, persistent searchable memory, automatic summarisation |
+| 4 | 0.4.0 | YOLO object detection (ONNX), optical‑flow tracking, dynamic macro resolution, spatial‑context LLM prompts |
 
-**New in 0.4.0:**
-
-- **YOLO object detection** — ONNX-based detector (`yolo11n.onnx`) with
-  COCO 80-class recognition, bounding boxes, confidence scoring, and
-  centre‑point targeting; inference runs in a dedicated thread pool to
-  avoid blocking the async event loop.
-- **Optical flow tracker** — lightweight Lucas‑Kanade optical flow
-  bridges gaps between detection frames, maintaining persistent
-  tracked IDs across consecutive frames without re‑running inference.
-- **Spatial context builder** — converts raw detections into
-  human‑readable text (`"person detected at centre‑middle"`) that is
-  injected into the LLM prompt, giving the agent spatial awareness.
-- **Vision‑OCR scheduling** — strict scheduling rules prevent overlap:
-  OCR always has priority, vision runs at staggered intervals with
-  configurable latency gates and contention tracking.
-- **Dynamic macro resolver** — `MacroResolver` converts `dynamic_attack`
-  and `dynamic_collect` macro steps into concrete `mouse_move` +
-  `click` coordinates using real‑time detections, with
-  nearest‑to‑centre target selection.
-- **Vision‑aware LLM prompts** — extended `build_llm_prompt()` appends
-  spatial context text and a dynamic JSON macro schema so the LLM can
-  request object‑targeted actions.
-- **Phase 4 integration test** — synthetic game window with drawn
-  enemies and potions validates the full vision pipeline: detection →
-  spatial context → dynamic macro resolution → LLM decision
-  end‑to‑end.
-- **Phase 4 Live Demo** — interactive OpenCV window with YOLO overlay,
-  targeting reticles, vision status panel, MCP memory, summariser,
-  and all vision controls in real time.
-
-**Phase 1 features** (screen capture, input injection, window auto-focus,
-static macro playback, Ollama health check), **Phase 2 features**
-(colour bar detection, OCR, state processor, LLM decision, adaptive
-frame skipping), and **Phase 3 features** (MCP memory server, memory
-client, memory‑aware decision loop, summariser) are all still available
-and work as before.
-
+All features from previous phases remain available and work as before.
 
 ## Installation
 
@@ -107,6 +59,8 @@ and work as before.
 - Python 3.12+
 - Tesseract OCR: `sudo apt install tesseract-ocr`
 - On X11: `python-xlib` is installed automatically via pip
+- tkinter: `sudo apt install python3-tk` (usually pre‑installed;
+  required for the GUI)
 
 ### Setup
 
@@ -140,167 +94,69 @@ The configured model is `phi3.5:3.8b-mini-instruct-q4_K_M` by default
 ollama pull phi3.5:3.8b-mini-instruct-q4_K_M
 ```
 
-
 ## Quick Start
 
-### Phase 1 — single macro execution
+### Desktop GUI (new in 0.5.0)
 
 ```bash
 source venv/bin/activate
+python main.py --gui
+```
+
+Launches the full Tkinter application with log dashboard, calibration
+overlay, macro editor, settings, health monitor, and profile manager.
+
+### Command‑Line Modes
+
+```bash
+# Single macro execution
 python main.py --macro test --ready-delay 3
-```
 
-### Phase 3 — full memory loop
-
-```bash
-source venv/bin/activate
-python tests/live_demo_phase3.py
-```
-
-### Phase 2 — continuous decision loop
-
-```bash
-source venv/bin/activate
+# Continuous decision loop
 python main.py --loop
+
+# Use a per‑game profile from ~/.gameai/profiles/<name>/
+python main.py --loop --profile <name>
 ```
 
-This runs the full perception → LLM → action loop using the bundled
-`config/` files (regions, state schema, macros).  Press **Ctrl+C** to stop.
+### Live Demos (no game window needed)
 
-Use `--profile <name>` to load profile files from
-`~/.gameai/profiles/<name>/` instead.
+| Demo | Command | What It Shows |
+|------|---------|--------------|
+| Phase 4 (vision) | `python tests/live_demo_phase4.py` | YOLO overlay, dynamic clicks, MCP, summariser |
+| Phase 3 (memory) | `python tests/live_demo_phase3.py` | MCP memory, LLM decisions, summariser |
+| Phase 2 (perception) | `python tests/live_demo.py` | Health bars, OCR, LLM pipeline |
 
-### Live Demo (no game window needed)
-
-The live demo creates a synthetic game frame with colour bars and OCR text
-so you can see the entire Phase 2 pipeline in action without launching a game:
-
-```bash
-source venv/bin/activate
-python tests/live_demo.py
-```
-
-Controls:
-
-| Key | Action |
-|-----|--------|
-| `1` | Set health to 78 % (healthy) |
-| `2` | Set health to 15 % (critical) |
-| `3` | Set health to 5 % (near-death) |
-| `h` | Toggle health bar visibility |
-| `o` | Toggle OCR text rendering |
-| `q` / `Esc` | Quit |
-
-The window shows detected health/mana percentages, OCR text, the state
-hash, the LLM-chosen action, and the LLM response time.  If Ollama is
-unreachable a warning is shown and LLM calls are skipped.
-
-### Phase 3 Live Demo (memory pipeline)
-
-The Phase 3 demo launches the full memory pipeline — MCP server, Ollama,
-summariser, and decision loop — all running against a synthetic game
-window:
-
-```bash
-source venv/bin/activate
-python tests/live_demo_phase3.py
-```
-
-This demo auto‑starts the bundled MCP memory server, pulls the Ollama
-model if needed, pre‑seeds demo memories, and launches the Memory
-Summariser background task.  A side‑by‑side overlay shows:
-
-- Health/mana, state hash, MCP and Ollama status
-- LLM‑chosen action and response time
-- Recent memory search results
-- Summariser state (events accumulated / threshold)
-- Real‑time MCP operation log
-
-Controls:
-
-| Key | Action |
-|-----|--------|
-| `1` | Set health to 78 % (healthy) |
-| `2` | Set health to 15 % (critical) |
-| `3` | Set health to  5 % (near‑death) |
-| `s` | Force‑store current state + action as memory |
-| `m` | Toggle MemorySummariser on/off |
-| `t` | Trigger an immediate summarisation cycle |
-| `r` | Reset all demo memories (delete + re‑seed) |
-| `q` / `Esc` | Quit |
-
-If the MCP server or Ollama are unreachable the demo degrades
-gracefully with status warnings in the overlay.
-
-### Phase 4 Live Demo (vision pipeline)
-
-The Phase 4 demo launches the full vision pipeline — YOLO object
-detector, optical flow tracker, spatial context builder, MCP memory
-server, Ollama, summariser, and decision loop — all running against a
-synthetic game window:
-
-```bash
-source venv/bin/activate
-python tests/live_demo_phase4.py
-```
-
-This demo auto‑loads the YOLO ONNX model (`models/yolo11n.onnx`),
-starts the bundled MCP memory server, pre‑warms ONNX embeddings, pulls
-the Ollama model if needed, and launches all Phase 4 subsystems.  The
-overlay shows:
-
-- Health/mana bars, state hash, MCP and Ollama status
-- LLM‑chosen action (including dynamic macro resolution), response time
-- YOLO detection overlay with bounding boxes and labels
-- Targeting reticles on detected objects
-- Vision status panel (detections, scheduler latency, tracking IDs)
-- Memory search results and summariser state
-- Real‑time MCP operation log
-
-Controls:
-
-| Key | Action |
-|-----|--------|
-| `1` | Set health to 78 % (healthy) |
-| `2` | Set health to 15 % (critical) |
-| `3` | Set health to  5 % (near‑death) |
-| `e` | Spawn enemy (red rect, simulated ``person`` class) |
-| `p` | Spawn potion (blue rect, simulated ``bottle`` class) |
-| `c` | Clear all spawned objects |
-| `s` | Force‑store current state + action as memory |
-| `m` | Toggle MemorySummariser on/off |
-| `t` | Trigger an immediate summarisation cycle |
-| `r` | Reset all demo memories (delete + re‑seed) |
-| `q` / ``Esc`` | Quit |
-
-If vision fails to load (missing ONNX model or onnxruntime), the demo
-degrades gracefully — health bars, OCR, LLM, and memory all continue
-while vision is simply skipped.
-
+Each demo opens an interactive OpenCV window with on‑screen controls;
+press `q` or `Esc` to quit.
 
 ## Running Tests
 
 ```bash
 source venv/bin/activate
+
+# All tests
 pytest tests/ -v
+
+# Phase 5 tests only (208 tests)
+python -m pytest tests/test_phase5_*.py -v
 ```
 
 Tests marked `requires_ollama` will automatically skip if Ollama isn't
 running.
 
-
 ## Configuration Files
 
 All JSON files live under `config/` (bundled defaults) or
-`~/.gameai/profiles/<name>/` (per-game overrides).
+`~/.gameai/profiles/<name>/` (per‑game overrides).  The GUI Settings
+panel writes directly to `config.json` at runtime.
 
 | File | Purpose |
 |------|---------|
-| `config.json` | Global settings (Ollama URL, model, diff, cache TTLs) |
+| `config.json` | Global settings (Ollama URL, model, vision, diff, cache TTLs) |
 | `regions.json` | Screen region definitions with `role` → state slot mapping |
 | `state_schema.json` | Declares known state slots and their types/priorities |
 | `macros.json` | Named macro definitions the LLM can choose from |
-
 
 ## Troubleshooting
 
@@ -310,12 +166,15 @@ All JSON files live under `config/` (bundled defaults) or
 | `ModuleNotFoundError: No module named 'pynput'` | evdev failed to build | If on X11: `pip install --no-deps pynput` |
 | Capture returns `None` | No window found or Wayland without `capture_region` | On Wayland, set `capture_region` in config. On X11, ensure a game window is active. |
 | Macro does nothing or wrong keys | Input backend mismatch or evdev missing | Check the log for `Input backend active: ...`. On Wayland, ensure ydotoold is running. |
-| Window auto-focus fails | "Game Window" is a placeholder | Expected in Phase 1/2. Real window titles come from game profiles (Phase 5 calibration UI). |
+| Window auto‑focus fails | "Game Window" is a placeholder | Real window titles come from game profiles created with the calibration UI (`--gui`). |
 | Ollama warning or LLM fallback to WAIT | Ollama not running or model not pulled | Start `ollama serve`, then `ollama pull <model>`. The agent gracefully falls back to the previous action or WAIT. |
 | Tesseract error / OCR unavailable | `tesseract-ocr` not installed | `sudo apt install tesseract-ocr` |
 | Live demo window doesn't appear | No X11 display or headless environment | The live demo requires a GUI display (uses OpenCV `cv2.imshow`). |
-
+| GUI fails to start (`_tkinter` not found) | `python3-tk` system package missing | `sudo apt install python3-tk` |
+| `ModuleNotFoundError: No module named 'tkinter'` | venv can't see system tkinter | Set `include-system-site-packages = true` in `venv/pyvenv.cfg` |
 
 ## AI Usage Disclosure
 
-This project was almost entirely coded by AI models (Deepseek V4 Pro, with Embedding Models assistance), with extensive human guidance, project management, and testing.
+This project was almost entirely coded by AI models (Deepseek V4 Pro,
+with Embedding Models assistance), with extensive human guidance,
+project management, and testing.

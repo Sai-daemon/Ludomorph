@@ -5,17 +5,41 @@
       "name": "hp_bar",
       "type": "color_bar",
       "role": "health",
-      "bounds": [100, 200, 300, 230],
-      "preprocess": ["grayscale", "threshold"],
+      "bounds": [
+        100,
+        200,
+        300,
+        230
+      ],
+      "preprocess": [
+        "grayscale",
+        "threshold"
+      ],
       "calibration": {
         "enabled": true,
         "bar_type": "solid_horizontal",
         "orientation": "left_to_right",
         "total_length_px": 200,
-        "fill_hsv_lower": [0, 100, 100],
-        "fill_hsv_upper": [10, 255, 255],
-        "empty_hsv_lower": [0, 0, 0],
-        "empty_hsv_upper": [179, 30, 40],
+        "fill_hsv_lower": [
+          0,
+          100,
+          100
+        ],
+        "fill_hsv_upper": [
+          10,
+          255,
+          255
+        ],
+        "empty_hsv_lower": [
+          0,
+          0,
+          0
+        ],
+        "empty_hsv_upper": [
+          179,
+          30,
+          40
+        ],
         "use_fill_mask": true,
         "method": "projection",
         "confidence_threshold": 0.6,
@@ -26,8 +50,17 @@
       "name": "hp_text",
       "type": "ocr",
       "role": "health_text",
-      "bounds": [100, 230, 300, 260],
-      "preprocess": ["grayscale", "upscale(2x)", "denoise"],
+      "bounds": [
+        100,
+        230,
+        300,
+        260
+      ],
+      "preprocess": [
+        "grayscale",
+        "upscale(2x)",
+        "denoise"
+      ],
       "ocr": {
         "confidence_threshold": 0.6,
         "cache_ttl_seconds": 2.0,
@@ -38,17 +71,41 @@
       "name": "mana_bar",
       "type": "color_bar",
       "role": "mana",
-      "bounds": [100, 270, 300, 300],
-      "preprocess": ["grayscale", "threshold"],
+      "bounds": [
+        100,
+        270,
+        300,
+        300
+      ],
+      "preprocess": [
+        "grayscale",
+        "threshold"
+      ],
       "calibration": {
         "enabled": true,
         "bar_type": "solid_horizontal",
         "orientation": "left_to_right",
         "total_length_px": 200,
-        "fill_hsv_lower": [90, 100, 100],
-        "fill_hsv_upper": [130, 255, 255],
-        "empty_hsv_lower": [0, 0, 0],
-        "empty_hsv_upper": [179, 30, 40],
+        "fill_hsv_lower": [
+          90,
+          100,
+          100
+        ],
+        "fill_hsv_upper": [
+          130,
+          255,
+          255
+        ],
+        "empty_hsv_lower": [
+          0,
+          0,
+          0
+        ],
+        "empty_hsv_upper": [
+          179,
+          30,
+          40
+        ],
         "use_fill_mask": true,
         "method": "projection",
         "confidence_threshold": 0.6,
@@ -59,8 +116,17 @@
       "name": "mana_text",
       "type": "ocr",
       "role": "mana_text",
-      "bounds": [100, 300, 300, 330],
-      "preprocess": ["grayscale", "upscale(2x)", "denoise"],
+      "bounds": [
+        100,
+        300,
+        300,
+        330
+      ],
+      "preprocess": [
+        "grayscale",
+        "upscale(2x)",
+        "denoise"
+      ],
       "ocr": {
         "confidence_threshold": 0.6,
         "cache_ttl_seconds": 2.0,
@@ -71,8 +137,17 @@
       "name": "location_text",
       "type": "ocr",
       "role": "location",
-      "bounds": [10, 10, 500, 50],
-      "preprocess": ["grayscale", "denoise", "deskew"],
+      "bounds": [
+        10,
+        10,
+        500,
+        50
+      ],
+      "preprocess": [
+        "grayscale",
+        "denoise",
+        "deskew"
+      ],
       "ocr": {
         "confidence_threshold": 0.6,
         "cache_ttl_seconds": 2.0
@@ -82,11 +157,59 @@
       "name": "objective_text",
       "type": "ocr",
       "role": "objective",
-      "bounds": [10, 60, 500, 100],
-      "preprocess": ["grayscale", "denoise"],
+      "bounds": [
+        10,
+        60,
+        500,
+        100
+      ],
+      "preprocess": [
+        "grayscale",
+        "denoise"
+      ],
       "ocr": {
         "confidence_threshold": 0.6,
         "cache_ttl_seconds": 5.0
+      }
+    },
+    {
+      "name": "enemy_present",
+      "type": "ocr",
+      "role": "enemy_present",
+      "bounds": [
+        664,
+        193,
+        907,
+        241
+      ],
+      "preprocess": [
+        "grayscale",
+        "upscale(2x)",
+        "denoise"
+      ],
+      "ocr": {
+        "confidence_threshold": 0.6,
+        "cache_ttl_seconds": 2.0
+      }
+    },
+    {
+      "name": "inventory",
+      "type": "ocr",
+      "role": "inventory",
+      "bounds": [
+        1324,
+        63,
+        1598,
+        364
+      ],
+      "preprocess": [
+        "grayscale",
+        "upscale(2x)",
+        "denoise"
+      ],
+      "ocr": {
+        "confidence_threshold": 0.6,
+        "cache_ttl_seconds": 2.0
       }
     }
   ]

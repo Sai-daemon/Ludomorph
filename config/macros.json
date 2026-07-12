@@ -5,47 +5,101 @@
       "name": "move_forward",
       "description": "Press W for half a second",
       "actions": [
-        {"type": "key", "key": "w", "hold_ms": 500}
+        {
+          "type": "key",
+          "key": "w",
+          "hold_ms": 500
+        }
       ]
     },
     {
       "name": "jump",
       "description": "Quick spacebar tap",
       "actions": [
-        {"type": "key", "key": "space", "hold_ms": 100}
+        {
+          "type": "key",
+          "key": "space",
+          "hold_ms": 100
+        }
       ]
     },
     {
       "name": "ui_click_top_left",
       "description": "Move mouse to (100, 200) and left click",
       "actions": [
-        {"type": "mouse_move", "x": 100, "y": 200, "relative": false},
-        {"type": "click", "button": "left"}
+        {
+          "type": "mouse_move",
+          "x": 100,
+          "y": 200,
+          "relative": false
+        },
+        {
+          "type": "click",
+          "button": "left"
+        }
       ]
     },
     {
       "name": "pause_menu",
       "description": "Press Escape to open pause menu",
       "actions": [
-        {"type": "key", "key": "escape", "hold_ms": 100}
+        {
+          "type": "key",
+          "key": "escape",
+          "hold_ms": 100
+        }
       ]
     },
     {
       "name": "jump_attack",
       "description": "Jump, wait 500ms, then attack",
       "actions": [
-        {"type": "key", "key": "space", "hold_ms": 100},
-        {"type": "delay", "ms": 500},
-        {"type": "key", "key": "a", "hold_ms": 100}
+        {
+          "type": "key",
+          "key": "space",
+          "hold_ms": 100
+        },
+        {
+          "type": "delay",
+          "ms": 500
+        },
+        {
+          "type": "key",
+          "key": "a",
+          "hold_ms": 100
+        }
       ]
     },
     {
       "name": "test",
       "description": "Test01",
       "actions": [
-        {"type": "key", "key": "d", "hold_ms": 100},
-        {"type": "key", "key": "a", "hold_ms": 100},
-        {"type": "key", "key": "y", "hold_ms": 100}
+        {
+          "type": "key",
+          "key": "d",
+          "hold_ms": 100
+        },
+        {
+          "type": "key",
+          "key": "a",
+          "hold_ms": 100
+        },
+        {
+          "type": "key",
+          "key": "y",
+          "hold_ms": 100
+        }
+      ]
+    },
+    {
+      "name": "new_macro",
+      "description": "Describe this macro",
+      "actions": [
+        {
+          "type": "key",
+          "key": "a",
+          "hold_ms": 100
+        }
       ]
     }
   ]
