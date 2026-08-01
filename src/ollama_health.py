@@ -242,7 +242,7 @@ async def ollama_health_check(
     model: str = config.get("ollama_model", "")
     base_url = _strip_openai_suffix(ollama_url)
 
-    logger.info(f"Running Ollama health check against {base_url} (model: {model})")
+    logger.debug(f"Running Ollama health check against {base_url} (model: {model})")
 
     result = OllamaHealthResult(
         configured_model=model,

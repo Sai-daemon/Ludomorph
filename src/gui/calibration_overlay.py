@@ -1,79 +1,43 @@
 """
-Region Calibration Overlay — Phases 5.2 & 5.3
+Phase 5.2 / 5.3 — Calibration Overlay.
 
-Transparent full‑screen Tkinter overlay for defining screen regions.
-Users draw bounding boxes on a game screenshot, assign each region a
-**role** (mapped to a state‑schema slot) and a **type** (OCR or Colour
-Bar), get a live OCR preview, and save the definitions to regions.json.
+A resizable, fully‑opaque Toplevel window that lets the user draw rectangles
+over a game screenshot and assign region roles (OCR, colour bar) with metadata.
+Also supports Phase 5.3 colour‑bar calibration via "Capture Empty / Full"
+buttons and automatic HSV threshold computation.
 
-Phase 5.3 adds:
-- Live screen capture (overlay hides briefly) for empty/full bar captures.
-- Delegated HSV threshold computation via ``TwoPointCalibrationLoader``.
-- Bar‑type and orientation dropdowns for colour‑bar regions.
-- Visual status feedback (button colours, capture‑ready indicators).
-- Preview Mask button for verifying calibration quality.
+Uses a standard title bar so the user can move/resize the window freely.
+All controls are rendered on an opaque background for maximum readability.
 
-Design follows ``Calibration_UI_research.md`` Problems 2 & 3.
+Uses the centralised theme system from ``src.gui.theme``.
 """
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Any, Callable
-
-import cv2
-import numpy as np
 import tkinter as tk
 from tkinter import ttk
+from typing import Any
+from enum import Enum
 
+import numpy as np
+from PIL import Image, ImageTk
+
+from src.gui.theme import ThemeManager, resolve_font_stack
 from src.logging_config import get_logger
+from src.utils.region_normalizer import normalise_region_bounds
 
 logger = get_logger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Enums
+# RegionRole
 # ---------------------------------------------------------------------------
 
 
 class RegionRole(str, Enum):
-    """Valid region types (matches regions.json ``type`` field)."""
-
     OCR = "ocr"
     COLOUR_BAR = "color_bar"
 
-
-# Human‑readable labels for the dropdown
-_ROLE_LABELS: dict[RegionRole, str] = {
-    RegionRole.OCR: "OCR (text region)",
-    RegionRole.COLOUR_BAR: "Colour Bar (health/mana/etc.)",
-}
-
-# Valid bar types and orientations (matches bar_detector constants)
-_BAR_TYPES = [
-    "solid_horizontal",
-    "solid_vertical",
-    "gradient",
-    "segmented",
-    "radial",
-]
-
-_ORIENTATIONS = [
-    "left_to_right",
-    "right_to_left",
-    "top_to_bottom",
-    "bottom_to_top",
-    "radial",
-]
-
-# Colour palette
-_BG = "#2D2D2D"
-_FG = "#D4D4D4"
-_ACCENT = "#0078D4"
-_SUCCESS = "#50C878"
-_DANGER = "#E04040"
-_WARNING = "#E8A317"
-_AMBER = "#E8A317"
-_AMBER_DARK = "#5C3A00"
 
 # ---------------------------------------------------------------------------
 # CalibrationTool
@@ -81,1045 +45,534 @@ _AMBER_DARK = "#5C3A00"
 
 
 class CalibrationTool(tk.Toplevel):
-    """Transparent full‑screen overlay for drawing screen regions.
+    """Resizable window for game‑state region calibration.
 
-    Args:
-        parent: The root ``AsyncTk`` window.
-        screenshot: BGR (H, W, 3) numpy array of the full game window.
-        ocr_module: Optional ``OCRModule`` for live OCR preview.
-        existing_regions: Previously saved regions to pre‑populate.
-        state_schema_slots: Dict of slot‑name → slot‑definition (from
-            state_schema.json).  Populates the role dropdown.
-        on_save: Optional callback invoked with the collected region list
-            when the user clicks "Done".
-        screen_capture: Optional async callable that returns a fresh
-            BGR screenshot.  Used by Phase 5.3 for live capture of
-            empty/full bar states.  Signature: ``async def() -> np.ndarray``.
+    Parameters
+    ----------
+    parent : tk.Widget
+    screenshot : np.ndarray
+        BGR screenshot of the game (used as canvas background).
+    ocr_module : optional
+        OCR module for live preview.
+    existing_regions : list[dict]
+        Previously saved regions to display.
+    state_schema_slots : dict
+        State schema slot names → metadata for the role dropdown.
+    on_save : callable
+        Called with ``list[dict]`` when user clicks Finish.
+    screen_capture : callable or None
+        Zero‑argument callable that returns a fresh screenshot (Phase 5.3).
     """
 
     def __init__(
         self,
-        parent: tk.Tk,
+        parent: tk.Widget,
         screenshot: np.ndarray,
         ocr_module: Any = None,
         existing_regions: list[dict[str, Any]] | None = None,
         state_schema_slots: dict[str, dict[str, str]] | None = None,
         on_save: Any = None,
-        screen_capture: Callable[..., Any] | None = None,
+        screen_capture: Any = None,
     ) -> None:
         super().__init__(parent)
-        self._screenshot = screenshot
-        self._ocr_module = ocr_module
+
+        self._tm = ThemeManager()
+        p = self._tm.palette
+        self._ui_font = resolve_font_stack(p.ui_font)
+        self._mono_font = resolve_font_stack(p.mono_font)
+
+        self.ocr_module = ocr_module
+        self._collected_regions: list[dict[str, Any]] = existing_regions or []
+        self._state_schema_slots = state_schema_slots or {}
         self._on_save = on_save
-        self._screen_capture_fn = screen_capture
+        self._screen_capture = screen_capture
 
-        # Collected regions — each is a dict ready for regions.json
-        self._collected_regions: list[dict[str, Any]] = []
-        if existing_regions:
-            self._collected_regions = list(existing_regions)
+        # Window setup — standard framed, opaque, resizable
+        self.title("Region Calibration — Ludomorph")
+        self.configure(bg=p.bg)
+        self.geometry("1200x800+50+50")
+        self.minsize(800, 500)
 
-        # Drawing state
-        self._dragging: bool = False
-        self._start_x: float = 0.0
-        self._start_y: float = 0.0
-        self._end_x: float = 0.0
-        self._end_y: float = 0.0
+        # Current drag state
+        self._start_x: int = 0
+        self._start_y: int = 0
         self._rect_id: int | None = None
+        self._drawing: bool = False
 
-        # Colour‑bar calibration captures (Phase 5.3 — live capture + compute)
-        self._empty_capture: np.ndarray | None = None
-        self._full_capture: np.ndarray | None = None
+        # Scale factor for mapping canvas coords → real screenshot coords
+        self._scale: float = 1.0
 
-        # Widget references for status feedback (Phase 5.3)
-        self._btn_capture_empty: tk.Button | None = None
-        self._btn_capture_full: tk.Button | None = None
-        self._btn_preview_mask: tk.Button | None = None
+        # Colour‑bar calibration state (Phase 5.3)
+        self._empty_frame: np.ndarray | None = None
+        self._full_frame: np.ndarray | None = None
+        self._selected_for_cal: dict[str, Any] | None = None
+        self._empty_ok: bool = False
+        self._full_ok: bool = False
 
-        # Bar type / orientation overrides (Phase 5.3 dropdowns)
-        self._bar_type_var: tk.StringVar | None = None
-        self._orientation_var: tk.StringVar | None = None
+        self._build_ui(screenshot)
 
-        # Slot names for the role dropdown
-        self._slot_names: list[str] = []
-        if state_schema_slots:
-            self._slot_names = sorted(state_schema_slots.keys())
-
-        self._setup_ui()
-        self._logger = get_logger(f"{__name__}.{self.__class__.__name__}")
-        self._logger.info("Calibration overlay opened.")
+        # Bind escape to close
+        self.bind("<Escape>", lambda e: self._on_finish())
 
     # ------------------------------------------------------------------
-    # UI construction
+    # Build UI
     # ------------------------------------------------------------------
 
-    def _setup_ui(self) -> None:
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        self.geometry(f"{sw}x{sh}+0+0")
-        self.overrideredirect(True)
-        self.attributes("-alpha", 0.75)
-        self.attributes("-topmost", True)
-        self.configure(bg="black")
+    def _build_ui(self, screenshot: np.ndarray) -> None:
+        """Build the layout: scrollable screenshot canvas + control panel."""
+        p = self._tm.palette
 
-        # -- Canvas (the screenshot + drawing surface) ------------------------
+        h, w = screenshot.shape[:2]
+
+        # Canvas fills most of the window with a frame
+        canvas_frame = tk.Frame(self, bg=p.bg, highlightthickness=0)
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=(2, 0))
+
         self._canvas = tk.Canvas(
-            self, width=sw, height=sh, highlightthickness=0, bg="black"
+            canvas_frame,
+            bg=p.bg, highlightthickness=0, cursor="cross",
         )
         self._canvas.pack(fill=tk.BOTH, expand=True)
 
-        # Convert BGR screenshot to RGB for PIL
-        from PIL import Image, ImageTk
+        # Convert screenshot to PhotoImage at native resolution
+        pil_img = Image.fromarray(screenshot[:, :, ::-1])  # BGR → RGB
+        self._original_w = w
+        self._original_h = h
+        self._pil_original = pil_img  # keep full-res for rescaling
+        self._tk_img = ImageTk.PhotoImage(pil_img)
 
-        rgb = cv2.cvtColor(self._screenshot, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-
-        # Scale screenshot to fill screen while preserving aspect ratio
-        img_w, img_h = img.size
-        scale = min(sw / img_w, sh / img_h)
-        new_w, new_h = int(img_w * scale), int(img_h * scale)
-        self._scale = scale
-        self._offset_x = (sw - new_w) // 2
-        self._offset_y = (sh - new_h) // 2
-
-        img_resized = img.resize((new_w, new_h), Image.NEAREST)
-        self._bg_image = ImageTk.PhotoImage(img_resized)
-        self._canvas.create_image(self._offset_x, self._offset_y, image=self._bg_image, anchor=tk.NW)
-
-        # Store dimensions for coordinate translation
-        self._img_x = self._offset_x
-        self._img_y = self._offset_y
-        self._img_w = new_w
-        self._img_h = new_h
-
-        # Draw existing regions
-        for region in self._collected_regions:
-            self._draw_existing_region(region)
-
-        # Bind mouse events
-        self._canvas.bind("<ButtonPress-1>", self._on_mouse_down)
-        self._canvas.bind("<B1-Motion>", self._on_mouse_move)
-        self._canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
-
-        # -- Floating toolbar -------------------------------------------------
-        self._build_toolbar()
-
-        # Keyboard shortcuts
-        self.bind("<Escape>", lambda _e: self._on_cancel())
-        self.bind("<Return>", lambda _e: self._on_save_region())
-
-    def _build_toolbar(self) -> None:
-        """Build the floating bottom toolbar."""
-        self._toolbar = tk.Frame(self, bg=_BG, relief=tk.RAISED, borderwidth=1)
-        self._toolbar.place(relx=0.5, rely=0.93, anchor=tk.CENTER)
-
-        # -- Role dropdown ----------------------------------------------------
-        role_frame = tk.Frame(self._toolbar, bg=_BG)
-        role_frame.pack(side=tk.LEFT, padx=4, pady=4)
-
-        tk.Label(role_frame, text="Role:", bg=_BG, fg=_FG, font=("Segoe UI", 9)).pack(
-            side=tk.LEFT, padx=(0, 2)
+        # Place the image; scaling happens in _redraw_image
+        self._canvas_img_id = self._canvas.create_image(
+            0, 0, anchor=tk.NW, image=self._tk_img
         )
 
-        self._role_var = tk.StringVar(value="")
-        role_menu = ttk.Combobox(
-            role_frame,
-            textvariable=self._role_var,
-            values=self._slot_names,
-            state="readonly" if self._slot_names else tk.DISABLED,
-            width=18,
+        # Mouse bindings
+        self._canvas.bind("<ButtonPress-1>", self._on_press)
+        self._canvas.bind("<B1-Motion>", self._on_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_release)
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # Control panel at the bottom
+        self._build_control_panel()
+
+        # Initial image sizing
+        self._redraw_image()
+
+    def _build_control_panel(self) -> None:
+        """Build the bottom control bar."""
+        p = self._tm.palette
+
+        ctrl = tk.Frame(self, bg=p.bg, padx=8, pady=5)
+        ctrl.pack(fill=tk.X, side=tk.BOTTOM)
+
+        # Role dropdown
+        role_frame = tk.Frame(ctrl, bg=p.bg)
+        role_frame.pack(side=tk.LEFT, padx=4)
+
+        tk.Label(role_frame, text="Role:", bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 9, "bold")).pack(side=tk.LEFT, padx=(0, 2))
+
+        self._role_var = tk.StringVar(value=RegionRole.OCR.value)
+        ttk.Combobox(
+            role_frame, textvariable=self._role_var,
+            values=[r.value for r in RegionRole], state="readonly", width=10,
+        ).pack(side=tk.LEFT)
+
+        # Region name entry
+        name_frame = tk.Frame(ctrl, bg=p.bg)
+        name_frame.pack(side=tk.LEFT, padx=4)
+
+        tk.Label(name_frame, text="Name:", bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 9, "bold")).pack(side=tk.LEFT, padx=(0, 2))
+
+        self._name_var = tk.StringVar()
+        tk.Entry(
+            name_frame, textvariable=self._name_var,
+            bg=p.entry_bg, fg=p.entry_fg, insertbackground=p.entry_insert,
+            font=(self._ui_font, 9), width=16, relief=tk.FLAT,
+        ).pack(side=tk.LEFT)
+
+        # Bar type / orientation
+        type_frame = tk.Frame(ctrl, bg=p.bg)
+        type_frame.pack(side=tk.LEFT, padx=4)
+
+        tk.Label(type_frame, text="Type:", bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 9, "bold")).pack(side=tk.LEFT, padx=(0, 2))
+
+        self._type_var = tk.StringVar(value="health")
+        ttk.Combobox(
+            type_frame, textvariable=self._type_var,
+            values=["health", "mana", "stamina", "experience", "other"],
+            state="readonly", width=10,
+        ).pack(side=tk.LEFT)
+
+        # Orientation
+        ori_frame = tk.Frame(ctrl, bg=p.bg)
+        ori_frame.pack(side=tk.LEFT, padx=4)
+
+        tk.Label(ori_frame, text="Dir:", bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 8, "bold")).pack(side=tk.LEFT, padx=(0, 1))
+
+        self._ori_var = tk.StringVar(value="horizontal")
+        ttk.Combobox(
+            ori_frame, textvariable=self._ori_var,
+            values=["horizontal", "vertical", "radial"], state="readonly", width=10,
+        ).pack(side=tk.LEFT)
+
+        # Capture Empty / Full buttons
+        self._btn_capture_empty = tk.Button(
+            ctrl, text="Capture Empty", command=self._on_capture_empty,
+            bg=p.warning, fg="#1E1E1E", font=(self._ui_font, 9, "bold"),
+            relief=tk.FLAT, state=tk.DISABLED,
         )
-        if self._slot_names:
-            role_menu.current(0)
-        role_menu.pack(side=tk.LEFT)
-        role_menu.bind("<<ComboboxSelected>>", self._on_role_changed)
+        self._btn_capture_empty.pack(side=tk.LEFT, padx=4)
 
-        # -- Type dropdown ----------------------------------------------------
-        type_frame = tk.Frame(self._toolbar, bg=_BG)
-        type_frame.pack(side=tk.LEFT, padx=4, pady=4)
-
-        tk.Label(type_frame, text="Type:", bg=_BG, fg=_FG, font=("Segoe UI", 9)).pack(
-            side=tk.LEFT, padx=(0, 2)
+        self._btn_capture_full = tk.Button(
+            ctrl, text="Capture Full", command=self._on_capture_full,
+            bg=p.warning, fg="#1E1E1E", font=(self._ui_font, 9, "bold"),
+            relief=tk.FLAT, state=tk.DISABLED,
         )
+        self._btn_capture_full.pack(side=tk.LEFT, padx=4)
 
-        self._type_var = tk.StringVar(value=RegionRole.OCR.value)
-        type_menu = ttk.Combobox(
-            type_frame,
-            textvariable=self._type_var,
-            values=[r.value for r in RegionRole],
-            state="readonly",
-            width=14,
+        # Preview Mask
+        self._btn_preview_mask = tk.Button(
+            ctrl, text="Preview Mask", command=self._on_preview_mask,
+            bg=p.accent, fg="white", font=(self._ui_font, 9, "bold"),
+            relief=tk.FLAT, state=tk.DISABLED,
         )
-        type_menu.current(0)
-        type_menu.pack(side=tk.LEFT)
-        type_menu.bind("<<ComboboxSelected>>", self._on_type_changed)
+        self._btn_preview_mask.pack(side=tk.LEFT, padx=4)
 
-        # -- Preview text -----------------------------------------------------
-        self._preview_text = tk.StringVar(value="Draw a rectangle on the screen")
-        preview_label = tk.Label(
-            self._toolbar,
-            textvariable=self._preview_text,
-            bg="#3C3C3C",
-            fg=_SUCCESS,
-            font=("Cascadia Code", 9),
-            width=42,
-            anchor=tk.W,
-            padx=4,
-        )
-        preview_label.pack(side=tk.LEFT, padx=4, pady=4)
-
-        # -- Dynamic action buttons -------------------------------------------
-        self._dynamic_btn_frame = tk.Frame(self._toolbar, bg=_BG)
-        self._dynamic_btn_frame.pack(side=tk.LEFT, padx=2, pady=4)
-
-        # Separator
-        ttk.Separator(self._toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=2)
-
-        # -- Save / Cancel / Done buttons ------------------------------------
+        # Save Region
         self._btn_save = tk.Button(
-            self._toolbar,
-            text="Save Region",
-            command=self._on_save_region,
-            bg=_ACCENT,
-            fg="white",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT,
-            padx=10,
-            pady=2,
-            state=tk.DISABLED,
+            ctrl, text="Save Region", command=self._on_save_region,
+            bg=p.success, fg="white", font=(self._ui_font, 9, "bold"),
+            relief=tk.FLAT, state=tk.DISABLED,
         )
-        self._btn_save.pack(side=tk.LEFT, padx=2)
+        self._btn_save.pack(side=tk.LEFT, padx=4)
 
-        self._btn_cancel = tk.Button(
-            self._toolbar,
-            text="Cancel",
-            command=self._on_cancel,
-            bg=_DANGER,
-            fg="white",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT,
-            padx=10,
-            pady=2,
+        # Delete Region
+        self._btn_delete = tk.Button(
+            ctrl, text="Delete Selected", command=self._on_delete,
+            bg=p.danger, fg="white", font=(self._ui_font, 9, "bold"),
+            relief=tk.FLAT, state=tk.DISABLED,
         )
-        self._btn_cancel.pack(side=tk.LEFT, padx=2)
+        self._btn_delete.pack(side=tk.LEFT, padx=4)
 
-        self._btn_done = tk.Button(
-            self._toolbar,
-            text="Done (Save All)",
-            command=self._on_done,
-            bg=_SUCCESS,
-            fg="#1E1E1E",
-            font=("Segoe UI", 9, "bold"),
-            relief=tk.FLAT,
-            padx=10,
-            pady=2,
-        )
-        self._btn_done.pack(side=tk.LEFT, padx=2)
+        # Spacer
+        tk.Frame(ctrl, bg=p.bg).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Region count label
+        # Region count
         self._lbl_count = tk.Label(
-            self._toolbar,
-            text=f"Regions: {len(self._collected_regions)}",
-            bg=_BG,
-            fg=_FG,
-            font=("Segoe UI", 9),
+            ctrl, text=f"Regions: {len(self._collected_regions)}",
+            bg=p.bg, fg=p.success, font=(self._mono_font, 9),
         )
-        self._lbl_count.pack(side=tk.LEFT, padx=4)
+        self._lbl_count.pack(side=tk.RIGHT, padx=4)
 
-        # Initial dynamic button state
-        self._update_dynamic_buttons()
+        # Preview text
+        self._preview_text = tk.StringVar(value="Draw a rectangle to begin.")
+        tk.Label(
+            ctrl, textvariable=self._preview_text,
+            bg=p.bg, fg=p.fg,
+            font=(self._ui_font, 9),
+        ).pack(side=tk.RIGHT, padx=10)
+
+        # Finish button
+        tk.Button(
+            ctrl, text="Finish", command=self._on_finish,
+            bg=p.accent, fg="white", font=(self._ui_font, 9, "bold"),
+            relief=tk.FLAT,
+        ).pack(side=tk.RIGHT, padx=4)
 
     # ------------------------------------------------------------------
-    # Mouse event handlers
+    # Canvas resize handler
     # ------------------------------------------------------------------
 
-    def _on_mouse_down(self, event: tk.Event) -> None:
-        """Start drawing a rectangle."""
-        self._dragging = True
+    def _on_canvas_resize(self, event: tk.Event | None = None) -> None:
+        """Re‑scale the screenshot to fit the canvas."""
+        self._redraw_image()
+
+    def _redraw_image(self) -> None:
+        """Scale the screenshot to fit the canvas and update the display.
+
+        The image is centred within the canvas so it is always fully
+        visible regardless of aspect‑ratio mismatches.
+        """
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw < 50 or ch < 50:
+            # Not yet realized — retry on idle
+            self.after(50, self._redraw_image)
+            return
+
+        # Compute scale (never upscale beyond native size)
+        self._scale = min(cw / self._original_w, ch / self._original_h, 1.0)
+        self._img_w = int(self._original_w * self._scale)
+        self._img_h = int(self._original_h * self._scale)
+
+        # Resize the PIL image
+        pil_scaled = self._pil_original.resize(
+            (self._img_w, self._img_h), Image.LANCZOS  # type: ignore[attr-defined]
+        )
+        self._tk_img = ImageTk.PhotoImage(pil_scaled)
+
+        # Centre the image within the canvas
+        self._offset_x = (cw - self._img_w) // 2
+        self._offset_y = (ch - self._img_h) // 2
+        self._canvas.coords(self._canvas_img_id, self._offset_x, self._offset_y)
+        self._canvas.itemconfig(self._canvas_img_id, image=self._tk_img)
+
+        # Redraw saved regions
+        self._redraw_saved_regions()
+
+    # ------------------------------------------------------------------
+    # Mouse handlers
+    # ------------------------------------------------------------------
+
+    def _on_press(self, event: tk.Event) -> None:
+        # Check if the click hit a saved-region tag — if so, defer to
+        # _on_saved_click and do NOT start a new rectangle draw.
+        overlapping = self._canvas.find_overlapping(
+            event.x - 1, event.y - 1, event.x + 1, event.y + 1
+        )
+        for item_id in overlapping:
+            tags = self._canvas.gettags(item_id)
+            for t in tags:
+                if t.startswith("saved_"):
+                    return  # handled by tag_bind → _on_saved_click
+
         self._start_x = event.x
         self._start_y = event.y
-        self._end_x = event.x
-        self._end_y = event.y
-
-        # Remove previous temporary rectangle
+        self._drawing = True
         if self._rect_id is not None:
             self._canvas.delete(self._rect_id)
-
         self._rect_id = self._canvas.create_rectangle(
-            self._start_x,
-            self._start_y,
-            self._end_x,
-            self._end_y,
-            outline="#FF4444",
-            width=2,
-            dash=(4, 2),
-            tag="selection",
+            event.x, event.y, event.x, event.y,
+            outline="#FFAA00", width=2, dash=(4, 2),
         )
 
-    def _on_mouse_move(self, event: tk.Event) -> None:
-        """Update rectangle while dragging."""
-        if not self._dragging or self._rect_id is None:
+    def _on_drag(self, event: tk.Event) -> None:
+        if not self._drawing or self._rect_id is None:
             return
-        self._end_x = event.x
-        self._end_y = event.y
-        self._canvas.coords(self._rect_id, self._start_x, self._start_y, self._end_x, self._end_y)
+        self._canvas.coords(self._rect_id, self._start_x, self._start_y, event.x, event.y)
 
-    def _on_mouse_up(self, event: tk.Event) -> None:
-        """Finalise the rectangle."""
-        self._dragging = False
-        self._end_x = event.x
-        self._end_y = event.y
-
-        width = abs(self._end_x - self._start_x)
-        height = abs(self._end_y - self._start_y)
-
-        if width < 5 or height < 5:
-            # Too small — discard
-            if self._rect_id is not None:
-                self._canvas.delete(self._rect_id)
-                self._rect_id = None
-            self._preview_text.set("Rectangle too small — redraw")
+    def _on_release(self, event: tk.Event) -> None:
+        if not self._drawing:
             return
-
-        # Enable Save button (role must also be set)
-        role = self._role_var.get()
-        if role:
-            self._btn_save.configure(state=tk.NORMAL)
-
-        self._update_preview_from_rect()
-
-    # ------------------------------------------------------------------
-    # Toolbar callbacks
-    # ------------------------------------------------------------------
-
-    def _on_role_changed(self, event: tk.Event) -> None:
-        """Called when the role dropdown selection changes."""
+        self._drawing = False
         self._check_save_enabled()
 
-    def _on_type_changed(self, event: tk.Event) -> None:
-        """Called when the type dropdown selection changes."""
-        self._update_dynamic_buttons()
-        self._update_preview_from_rect()
+    # ------------------------------------------------------------------
+    # Saved regions
+    # ------------------------------------------------------------------
 
-    def _update_dynamic_buttons(self) -> None:
-        """Replace dynamic action buttons based on the selected type.
+    def _redraw_saved_regions(self) -> None:
+        """Redraw all saved region rectangles scaled to current canvas.
 
-        Phase 5.3: Colour Bar type now includes bar‑type & orientation
-        dropdowns, capture buttons with status feedback, and a Preview
-        Mask button.
+        Uses ``normalise_region_bounds`` to accept regions stored in either
+        ``bbox: {x, y, width, height}`` or ``bounds: [x1, y1, x2, y2]`` format.
         """
-        for w in self._dynamic_btn_frame.winfo_children():
-            w.destroy()
-
-        # Reset references
-        self._btn_capture_empty = None
-        self._btn_capture_full = None
-        self._btn_preview_mask = None
-        self._bar_type_var = None
-        self._orientation_var = None
-
-        region_type = self._type_var.get()
-        if region_type == RegionRole.OCR.value:
-            btn = tk.Button(
-                self._dynamic_btn_frame,
-                text="Test OCR",
-                command=self._test_ocr,
-                bg=_ACCENT,
-                fg="white",
-                font=("Segoe UI", 9),
-                relief=tk.FLAT,
-                padx=10,
-                pady=2,
+        self._canvas.delete("saved")
+        for idx, region in enumerate(self._collected_regions):
+            nb = normalise_region_bounds(region)  # {x, y, width, height}
+            x1 = int(nb["x"] * self._scale)
+            y1 = int(nb["y"] * self._scale)
+            x2 = int((nb["x"] + nb["width"]) * self._scale)
+            y2 = int((nb["y"] + nb["height"]) * self._scale)
+            name = region.get("name", f"Region {idx + 1}")
+            selected = region is self._selected_for_cal
+            colour = self._tm.palette.selection if selected else self._tm.palette.success
+            line_width = 3 if selected else 2
+            # Create a unique tag per region for hit-testing on click
+            tag = f"saved_{idx}"
+            self._canvas.create_rectangle(
+                x1, y1, x2, y2, outline=colour, width=line_width,
+                tags=(tag, "saved"),
             )
-            btn.pack(side=tk.LEFT)
-        elif region_type == RegionRole.COLOUR_BAR.value:
-            # -- Bar type dropdown ------------------------------------------------
-            bar_type_frame = tk.Frame(self._dynamic_btn_frame, bg=_BG)
-            bar_type_frame.pack(side=tk.LEFT, padx=2)
-
-            tk.Label(bar_type_frame, text="Bar:", bg=_BG, fg=_FG, font=("Segoe UI", 8)).pack(
-                side=tk.LEFT, padx=(0, 1)
+            self._canvas.create_text(
+                x1 + 4, y1 + 4, text=name, anchor=tk.NW,
+                fill=colour, font=(self._ui_font, 9, "bold"),
+                tags=(tag, "saved"),
             )
-            self._bar_type_var = tk.StringVar(value=_BAR_TYPES[0])
-            bar_type_menu = ttk.Combobox(
-                bar_type_frame,
-                textvariable=self._bar_type_var,
-                values=_BAR_TYPES,
-                state="readonly",
-                width=14,
-            )
-            bar_type_menu.pack(side=tk.LEFT)
+            # Bind click on each saved region's rectangle for selection
+            self._canvas.tag_bind(tag, "<ButtonPress-1>",
+                                  lambda e, i=idx: self._on_saved_click(i))
 
-            # -- Orientation dropdown ---------------------------------------------
-            ori_frame = tk.Frame(self._dynamic_btn_frame, bg=_BG)
-            ori_frame.pack(side=tk.LEFT, padx=2)
-
-            tk.Label(ori_frame, text="Dir:", bg=_BG, fg=_FG, font=("Segoe UI", 8)).pack(
-                side=tk.LEFT, padx=(0, 1)
-            )
-            self._orientation_var = tk.StringVar(value=_ORIENTATIONS[0])
-            ori_menu = ttk.Combobox(
-                ori_frame,
-                textvariable=self._orientation_var,
-                values=_ORIENTATIONS,
-                state="readonly",
-                width=13,
-            )
-            ori_menu.pack(side=tk.LEFT)
-
-            # -- Capture Empty button ----------------------------------------------
-            self._btn_capture_empty = tk.Button(
-                self._dynamic_btn_frame,
-                text="Capture Empty",
-                command=self._on_capture_empty,
-                bg=_AMBER,
-                fg="#1E1E1E",
-                font=("Segoe UI", 9),
-                relief=tk.FLAT,
-                padx=8,
-                pady=2,
-            )
-            self._btn_capture_empty.pack(side=tk.LEFT, padx=1)
-
-            # -- Capture Full button -----------------------------------------------
-            self._btn_capture_full = tk.Button(
-                self._dynamic_btn_frame,
-                text="Capture Full",
-                command=self._on_capture_full,
-                bg=_AMBER,
-                fg="#1E1E1E",
-                font=("Segoe UI", 9),
-                relief=tk.FLAT,
-                padx=8,
-                pady=2,
-            )
-            self._btn_capture_full.pack(side=tk.LEFT, padx=1)
-
-            # -- Preview Mask button (disabled until both captures exist) ----------
-            self._btn_preview_mask = tk.Button(
-                self._dynamic_btn_frame,
-                text="Preview Mask",
-                command=self._on_preview_mask,
-                bg="#6A5ACD",
-                fg="white",
-                font=("Segoe UI", 9),
-                relief=tk.FLAT,
-                padx=8,
-                pady=2,
-                state=tk.DISABLED,
-            )
-            self._btn_preview_mask.pack(side=tk.LEFT, padx=1)
-
-            # Reflect any existing captures
-            self._update_capture_status()
-
-    # ------------------------------------------------------------------
-    # Region save
-    # ------------------------------------------------------------------
-
-    def _on_save_region(self) -> None:
-        """Save the currently drawn rectangle as a region definition."""
-        role = self._role_var.get().strip()
-        region_type = self._type_var.get()
-
-        if not role:
-            self._preview_text.set("ERROR: Select a role first")
+    def _on_saved_click(self, idx: int) -> None:
+        """Handle a click on a previously saved region."""
+        if idx < 0 or idx >= len(self._collected_regions):
             return
-        if not region_type:
-            self._preview_text.set("ERROR: Select a type first")
-            return
-
-        # Compute screen‑relative bounds from the selection
-        bounds = self._get_selection_bounds()
-        if bounds is None:
-            self._preview_text.set("ERROR: No valid rectangle drawn")
-            return
-
-        # Convert from display coords to screenshot image coords
-        img_bounds = self._display_to_image_bounds(bounds)
-        if img_bounds is None:
-            self._preview_text.set("ERROR: Rectangle outside image area")
-            return
-
-        # Generate a name from the role
-        region_name = self._generate_region_name(role)
-
-        region_dict: dict[str, Any] = {
-            "name": region_name,
-            "type": region_type,
-            "role": role,
-            "bounds": list(img_bounds),
-            "preprocess": self._default_preprocess(region_type),
-        }
-
-        if region_type == RegionRole.OCR.value:
-            region_dict["ocr"] = {
-                "confidence_threshold": 0.6,
-                "cache_ttl_seconds": 2.0,
-            }
-        elif region_type == RegionRole.COLOUR_BAR.value:
-            # Build calibration dict — use computed HSV if both captures exist
-            if self._empty_capture is not None and self._full_capture is not None:
-                bar_type = self._bar_type_var.get() if self._bar_type_var else "solid_horizontal"
-                orientation = self._orientation_var.get() if self._orientation_var else "left_to_right"
-                calib = self._compute_bar_hsv_thresholds(
-                    self._empty_capture,
-                    self._full_capture,
-                    bar_type=bar_type,
-                    orientation=orientation,
-                )
-                self._logger.info(
-                    f"Computed HSV calibration for '{region_name}': "
-                    f"bar_type={bar_type}, orientation={orientation}"
-                )
-            else:
-                # Placeholder defaults — user hasn't calibrated yet
-                calib = {
-                    "enabled": True,
-                    "bar_type": self._bar_type_var.get() if self._bar_type_var else "solid_horizontal",
-                    "orientation": self._orientation_var.get() if self._orientation_var else "left_to_right",
-                    "fill_hsv_lower": [0, 100, 100],
-                    "fill_hsv_upper": [10, 255, 255],
-                    "empty_hsv_lower": [0, 0, 0],
-                    "empty_hsv_upper": [179, 30, 40],
-                    "use_fill_mask": True,
-                    "method": "projection",
-                    "confidence_threshold": 0.6,
-                    "dynamic_adjustment": True,
-                }
-            region_dict["calibration"] = calib
-
-        # Add to collected list (replace existing with same name)
-        self._remove_region_by_name(region_name)
-        self._collected_regions.append(region_dict)
-
-        # Draw a persistent green rectangle
-        x1, y1, x2, y2 = bounds
-        self._canvas.create_rectangle(
-            x1, y1, x2, y2, outline=_SUCCESS, width=2, tag="saved"
-        )
-
-        # Clear selection
-        if self._rect_id is not None:
-            self._canvas.delete(self._rect_id)
-            self._rect_id = None
-
-        self._btn_save.configure(state=tk.DISABLED)
-        self._lbl_count.configure(text=f"Regions: {len(self._collected_regions)}")
-        self._preview_text.set(f"Saved '{region_name}' — {img_bounds}")
-
-        self._logger.info(
-            f"Region saved: name={region_name}, role={role}, type={region_type}, "
-            f"bounds={img_bounds}"
-        )
-
-        # Reset capture buffers and status
-        self._empty_capture = None
-        self._full_capture = None
-        self._update_capture_status()
-
-    def _on_cancel(self) -> None:
-        """Close the overlay without saving."""
-        self._logger.info("Calibration overlay cancelled.")
-        self.destroy()
-
-    def _on_done(self) -> None:
-        """Finish calibration and invoke the save callback."""
-        self._logger.info(f"Calibration done — {len(self._collected_regions)} regions collected.")
-
-        if self._on_save is not None:
-            self._on_save(self._collected_regions)
-
-        self.destroy()
-
-    # ------------------------------------------------------------------
-    # OCR preview
-    # ------------------------------------------------------------------
-
-    def _test_ocr(self) -> None:
-        """Run OCR on the currently selected rectangle and show result."""
-        bounds = self._get_selection_bounds()
-        if bounds is None:
-            self._preview_text.set("Draw a rectangle first, then test")
-            return
-
-        if self._ocr_module is None:
-            self._preview_text.set("OCR module not available")
-            return
-
-        img_bounds = self._display_to_image_bounds(bounds)
-        if img_bounds is None:
-            self._preview_text.set("Rectangle outside image area")
-            return
-
-        # Crop the screenshot
-        x1, y1, x2, y2 = img_bounds
-        cropped = self._screenshot[y1:y2, x1:x2]
-        if cropped.size == 0:
-            self._preview_text.set("Empty crop — redraw")
-            return
-
-        self._preview_text.set("Running OCR …")
-
-        # Run OCR synchronously (via thread pool internally)
-        import asyncio
-
-        async def _run() -> None:
-            from src.region_profile import RegionConfig
-
-            region_config = RegionConfig(
-                name="_preview_",
-                type="ocr",
-                role="preview",
-                bounds=img_bounds,
-                preprocess=["grayscale"],
-            )
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    result = await self._ocr_module.recognize_region(
-                        self._screenshot, region_config
-                    )
-                else:
-                    result = await asyncio.ensure_future(
-                        self._ocr_module.recognize_region(self._screenshot, region_config)
-                    )
-
-                if result.success:
-                    self._preview_text.set(
-                        f"OCR: '{result.text}' (conf={result.confidence:.2f})"
-                    )
-                else:
-                    self._preview_text.set(
-                        f"OCR low confidence: '{result.text}' ({result.confidence:.2f})"
-                    )
-            except Exception as exc:
-                self._preview_text.set(f"OCR error: {exc}")
-
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(_run())
-            else:
-                asyncio.run(_run())
-        except RuntimeError:
-            # No event loop available — run in a thread
-            import threading
-
-            def _run_thread() -> None:
-                asyncio.run(_run())
-
-            t = threading.Thread(target=_run_thread, daemon=True)
-            t.start()
-
-    # ------------------------------------------------------------------
-    # Colour bar capture — live screen capture (Phase 5.3)
-    # ------------------------------------------------------------------
-
-    def _on_capture_empty(self) -> None:
-        """Capture empty bar — uses live screen capture if available."""
-        self._capture_bar_reference(is_empty=True)
-
-    def _on_capture_full(self) -> None:
-        """Capture full bar — uses live screen capture if available."""
-        self._capture_bar_reference(is_empty=False)
-
-    def _capture_bar_reference(self, *, is_empty: bool) -> None:
-        """Grab a screenshot (live or static), crop to selection, and store.
-
-        Phase 5.3: If ``_screen_capture_fn`` is provided, the overlay hides
-        briefly, captures a fresh frame, then reapplies the overlay.  This
-        lets the user Alt+Tab to the game, change the bar state, then
-        Alt+Tab back and click the capture button.
-        """
-        bounds = self._get_image_selection()
-        if bounds is None:
-            self._preview_text.set("Draw a rectangle first")
-            return
-
-        x1, y1, x2, y2 = bounds
-
-        # Try live capture
-        captured_img: np.ndarray | None = None
-        if self._screen_capture_fn is not None:
-            try:
-                captured_img = self._do_live_capture()
-            except Exception as exc:
-                self._logger.warning(f"Live screen capture failed: {exc}")
-                self._preview_text.set(f"Live capture failed: {exc} — using static image")
-
-        # Fall back to the static screenshot
-        if captured_img is None:
-            captured_img = self._screenshot
-
-        # Crop
-        h, w = captured_img.shape[:2]
-        ix1 = max(0, min(x1, w))
-        iy1 = max(0, min(y1, h))
-        ix2 = max(0, min(x2, w))
-        iy2 = max(0, min(y2, h))
-        crop = captured_img[iy1:iy2, ix1:ix2].copy()
-
-        if is_empty:
-            self._empty_capture = crop
+        region = self._collected_regions[idx]
+        # Deselect if clicking the already-selected region
+        if self._selected_for_cal is region:
+            self._selected_for_cal = None
+            self._btn_delete.configure(state=tk.DISABLED)
+            self._preview_text.set("Selection cleared. Draw a rectangle or click a region.")
         else:
-            self._full_capture = crop
-
-        # Update status
-        self._update_capture_status()
-        self._check_save_enabled_for_bar()
-        self._logger.info(
-            f"{'Empty' if is_empty else 'Full'} bar captured: "
-            f"shape={crop.shape}, live={captured_img is not self._screenshot}"
-        )
-
-    def _do_live_capture(self) -> np.ndarray | None:
-        """Hide overlay, grab a fresh screenshot, show overlay.
-
-        Works with both sync and async screen_capture callables.
-        """
-        import asyncio
-
-        # Hide overlay so it doesn't appear in the capture
-        self.withdraw()
-        self.update_idletasks()  # process the withdraw
-
-        try:
-            if self._screen_capture_fn is None:
-                return None
-
-            # The capture callable may be async or sync
-            result = self._screen_capture_fn()
-            if asyncio.iscoroutine(result):
-                # Need an event loop
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                captured = loop.run_until_complete(result)
-            else:
-                captured = result
-
-            if captured is None:
-                return None
-
-            # Ensure BGR format
-            if len(captured.shape) == 2:
-                return cv2.cvtColor(captured, cv2.COLOR_GRAY2BGR)
-            if captured.shape[2] == 4:
-                return captured[:, :, :3]  # drop alpha
-            return captured
-        finally:
-            # Always restore the overlay
-            self.deiconify()
-            self.lift()
-            self.focus_force()
-
-    # ------------------------------------------------------------------
-    # Capture status feedback (Phase 5.3)
-    # ------------------------------------------------------------------
-
-    def _update_capture_status(self) -> None:
-        """Update button colours and labels based on capture state.
-
-        - Empty captured → button turns green, label shows ✓
-        - Full captured → button turns green, label shows ✓
-        - Both captured → Preview Mask enabled, Save ready
-        """
-        empty_ok = self._empty_capture is not None
-        full_ok = self._full_capture is not None
-
-        if self._btn_capture_empty is not None:
-            if empty_ok:
-                self._btn_capture_empty.configure(
-                    bg=_SUCCESS, fg="#1E1E1E", text="Empty ✓"
-                )
-            else:
-                self._btn_capture_empty.configure(
-                    bg=_AMBER, fg="#1E1E1E", text="Capture Empty"
-                )
-
-        if self._btn_capture_full is not None:
-            if full_ok:
-                self._btn_capture_full.configure(
-                    bg=_SUCCESS, fg="#1E1E1E", text="Full ✓"
-                )
-            else:
-                self._btn_capture_full.configure(
-                    bg=_AMBER, fg="#1E1E1E", text="Capture Full"
-                )
-
-        # Enable Preview Mask if both exist
-        if self._btn_preview_mask is not None:
-            if empty_ok and full_ok:
-                self._btn_preview_mask.configure(state=tk.NORMAL)
-            else:
-                self._btn_preview_mask.configure(state=tk.DISABLED)
-
-        # Update preview text
-        e_label = "✓" if empty_ok else "—"
-        f_label = "✓" if full_ok else "—"
-        if empty_ok and full_ok:
-            self._preview_text.set(f"Empty: {e_label} | Full: {f_label} — Ready to save ✓")
-        elif empty_ok or full_ok:
-            self._preview_text.set(f"Empty: {e_label} | Full: {f_label} — capture the other")
-        else:
-            self._preview_text.set(f"Empty: {e_label} | Full: {f_label} — capture both")
-
-    def _check_save_enabled_for_bar(self) -> None:
-        """Enable Save Region if both captures exist (for colour bar type)."""
-        if self._type_var.get() != RegionRole.COLOUR_BAR.value:
-            return
-        if self._empty_capture is not None and self._full_capture is not None:
-            role = self._role_var.get()
-            if role:
-                self._btn_save.configure(state=tk.NORMAL)
-
-    # ------------------------------------------------------------------
-    # Preview Mask (Phase 5.3)
-    # ------------------------------------------------------------------
-
-    def _on_preview_mask(self) -> None:
-        """Show a popup with the computed HSV mask applied to the full capture.
-
-        Lets the user verify calibration quality before saving.
-        """
-        if self._empty_capture is None or self._full_capture is None:
-            return
-
-        bar_type = self._bar_type_var.get() if self._bar_type_var else "solid_horizontal"
-        orientation = self._orientation_var.get() if self._orientation_var else "left_to_right"
-        calib = self._compute_bar_hsv_thresholds(
-            self._empty_capture, self._full_capture,
-            bar_type=bar_type, orientation=orientation,
-        )
-
-        full_img = self._full_capture
-        hsv = cv2.cvtColor(full_img, cv2.COLOR_BGR2HSV)
-
-        fill_lower = np.array(calib["fill_hsv_lower"], dtype=np.uint8)
-        fill_upper = np.array(calib["fill_hsv_upper"], dtype=np.uint8)
-        mask = cv2.inRange(hsv, fill_lower, fill_upper)
-
-        # Morphological cleanup
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        # Build a side‑by‑side preview: original | mask | overlay
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        overlay = full_img.copy()
-        overlay[mask > 0] = (0, 255, 0)  # bright green fill
-        blended = cv2.addWeighted(full_img, 0.4, overlay, 0.6, 0)
-
-        # Stack horizontally: [Original | Mask | Overlay]
-        stacked = np.hstack([full_img, mask_bgr, blended])
-        # Downscale if too wide
-        h_s, w_s = stacked.shape[:2]
-        max_w = 1200
-        if w_s > max_w:
-            scale = max_w / w_s
-            stacked = cv2.resize(stacked, (int(w_s * scale), int(h_s * scale)))
-
-        # Show in a Toplevel window
-        preview = tk.Toplevel(self)
-        preview.title("HSV Mask Preview")
-        preview.configure(bg="#1E1E1E")
-
-        from PIL import Image, ImageTk
-        rgb = cv2.cvtColor(stacked, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
-        self._mask_preview_image = ImageTk.PhotoImage(img)
-
-        canvas = tk.Canvas(preview, width=img.width, height=img.height, highlightthickness=0, bg="#1E1E1E")
-        canvas.pack(padx=4, pady=4)
-        canvas.create_image(0, 0, image=self._mask_preview_image, anchor=tk.NW)
-
-        info = tk.Label(
-            preview,
-            text=(
-                f"  Original  |  Fill Mask  |  Overlay  "
-                f"  —  bar_type={calib.get('bar_type', '?')}, "
-                f"orientation={calib.get('orientation', '?')}"
-            ),
-            bg="#1E1E1E", fg=_FG, font=("Segoe UI", 9),
-        )
-        info.pack(pady=(0, 4))
-
-        close_btn = tk.Button(preview, text="Close", command=preview.destroy, bg=_ACCENT, fg="white", font=("Segoe UI", 9))
-        close_btn.pack(pady=(0, 6))
-
-        preview.transient(self)
-        preview.grab_set()
-        self.wait_window(preview)
-        self._logger.info("Mask preview closed.")
-
-    # ------------------------------------------------------------------
-    # Coordinate helpers
-    # ------------------------------------------------------------------
-
-    def _get_selection_bounds(self) -> tuple[int, int, int, int] | None:
-        """Return the current selection as (x1, y1, x2, y2) in display coords."""
-        x1 = min(self._start_x, self._end_x)
-        y1 = min(self._start_y, self._end_y)
-        x2 = max(self._start_x, self._end_x)
-        y2 = max(self._start_y, self._end_y)
-        if x2 - x1 < 5 or y2 - y1 < 5:
-            return None
-        return (x1, y1, x2, y2)
-
-    def _display_to_image_bounds(
-        self, bounds: tuple[int, int, int, int]
-    ) -> tuple[int, int, int, int] | None:
-        """Convert display‑coordinate bounds to screenshot image coordinates."""
-        x1, y1, x2, y2 = bounds
-
-        # Convert to image‑relative coords
-        ix1 = int((x1 - self._img_x) / self._scale)
-        iy1 = int((y1 - self._img_y) / self._scale)
-        ix2 = int((x2 - self._img_x) / self._scale)
-        iy2 = int((y2 - self._img_y) / self._scale)
-
-        # Clamp to image dimensions
-        h, w = self._screenshot.shape[:2]
-        ix1 = max(0, min(ix1, w))
-        iy1 = max(0, min(iy1, h))
-        ix2 = max(0, min(ix2, w))
-        iy2 = max(0, min(iy2, h))
-
-        if ix1 >= ix2 or iy1 >= iy2:
-            return None
-
-        return (ix1, iy1, ix2, iy2)
-
-    def _get_image_selection(self) -> tuple[int, int, int, int] | None:
-        """Get the current selection in image coordinates."""
-        bounds = self._get_selection_bounds()
-        if bounds is None:
-            return None
-        return self._display_to_image_bounds(bounds)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+            self._selected_for_cal = region
+            name = region.get("name", "unnamed")
+            self._btn_delete.configure(state=tk.NORMAL)
+            self._preview_text.set(f"Selected '{name}'. Press Delete Selected to remove.")
+        self._redraw_saved_regions()
 
     def _check_save_enabled(self) -> None:
-        """Enable Save if we have a valid rect AND a role."""
+        """Enable/disable Save Region button based on current state."""
         role = self._role_var.get()
-        bounds = self._get_selection_bounds()
-        if role and bounds is not None:
+        name = self._name_var.get().strip()
+        is_custom = name not in self._state_schema_slots
+
+        if role == RegionRole.COLOUR_BAR.value:
+            self._check_save_enabled_for_bar()
+        elif role and (not is_custom or name):
             self._btn_save.configure(state=tk.NORMAL)
         else:
             self._btn_save.configure(state=tk.DISABLED)
 
-    def _update_preview_from_rect(self) -> None:
-        """Show coordinates of the current selection in the preview label."""
-        bounds = self._get_selection_bounds()
-        if bounds is None:
-            return
-        x1, y1, x2, y2 = bounds
-        w = x2 - x1
-        h = y2 - y1
-        img_bounds = self._display_to_image_bounds(bounds)
-        if img_bounds:
-            ix1, iy1, ix2, iy2 = img_bounds
-            self._preview_text.set(
-                f"Selection: ({x1},{y1}) {w}x{h}px "
-                f"→ Image: [{ix1}, {iy1}, {ix2}, {iy2}]"
-            )
+    def _check_save_enabled_for_bar(self) -> None:
+        """Enable Save Region if both captures exist."""
+        if self._empty_ok and self._full_ok:
+            self._btn_save.configure(state=tk.NORMAL)
         else:
-            self._preview_text.set(f"Selection: ({x1},{y1}) {w}x{h}px")
+            self._btn_save.configure(state=tk.DISABLED)
 
-    @staticmethod
-    def _default_preprocess(region_type: str) -> list[str]:
-        """Return sensible default preprocessing steps per region type."""
-        if region_type == RegionRole.OCR.value:
-            return ["grayscale", "upscale(2x)", "denoise"]
-        return ["grayscale", "threshold"]
+    # ------------------------------------------------------------------
+    # Capture Empty / Full (Phase 5.3)
+    # ------------------------------------------------------------------
 
-    def _generate_region_name(self, role: str) -> str:
-        """Create a unique region name from the role.
-
-        If ``role`` is not yet used, returns the role name directly.
-        Otherwise appends a suffix (e.g. ``health_2``).
-        """
-        existing = {r["name"] for r in self._collected_regions}
-        if role not in existing:
-            return role
-
-        counter = 2
-        while f"{role}_{counter}" in existing:
-            counter += 1
-        return f"{role}_{counter}"
-
-    def _remove_region_by_name(self, name: str) -> None:
-        """Remove a previously saved region by name."""
-        self._collected_regions = [r for r in self._collected_regions if r["name"] != name]
-        # Also clear saved rectangles and redraw
-        self._canvas.delete("saved")
-        for region in self._collected_regions:
-            self._draw_existing_region(region)
-
-    def _draw_existing_region(self, region: dict[str, Any]) -> None:
-        """Draw a green rectangle for an already‑saved region."""
-        bounds = region.get("bounds", [])
-        if len(bounds) != 4:
+    def _on_capture_empty(self) -> None:
+        """Capture an 'empty' frame for colour‑bar calibration."""
+        if self._screen_capture is None:
             return
-        ix1, iy1, ix2, iy2 = bounds
+        self.withdraw()
+        self.update_idletasks()
+        import time as _time
+        _time.sleep(0.15)
+        try:
+            frame = self._screen_capture()
+            if frame is not None:
+                self._empty_frame = frame
+                self._empty_ok = True
+        finally:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        self._update_capture_status()
 
-        # Convert image coords to display coords
-        x1 = int(ix1 * self._scale + self._img_x)
-        y1 = int(iy1 * self._scale + self._img_y)
-        x2 = int(ix2 * self._scale + self._img_x)
-        y2 = int(iy2 * self._scale + self._img_y)
+    def _on_capture_full(self) -> None:
+        """Capture a 'full' frame for colour‑bar calibration."""
+        if self._screen_capture is None:
+            return
+        self.withdraw()
+        self.update_idletasks()
+        import time as _time
+        _time.sleep(0.15)
+        try:
+            frame = self._screen_capture()
+            if frame is not None:
+                self._full_frame = frame
+                self._full_ok = True
+        finally:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        self._update_capture_status()
 
-        self._canvas.create_rectangle(
-            x1, y1, x2, y2, outline=_SUCCESS, width=2, tag="saved"
-        )
+    def _update_capture_status(self) -> None:
+        """Update button colours and labels based on capture state."""
+        p = self._tm.palette
+        if self._empty_ok:
+            self._btn_capture_empty.configure(bg=p.success, fg="#1E1E1E", text="Empty ✓")
+        else:
+            self._btn_capture_empty.configure(bg=p.warning, fg="#1E1E1E", text="Capture Empty")
+        if self._full_ok:
+            self._btn_capture_full.configure(bg=p.success, fg="#1E1E1E", text="Full ✓")
+        else:
+            self._btn_capture_full.configure(bg=p.warning, fg="#1E1E1E", text="Capture Full")
+        if self._empty_ok and self._full_ok:
+            self._btn_preview_mask.configure(state=tk.NORMAL)
+        else:
+            self._btn_preview_mask.configure(state=tk.DISABLED)
+        self._check_save_enabled_for_bar()
 
-        # Label with role name
-        self._canvas.create_text(
-            x1 + 4,
-            y1 + 4,
-            text=region.get("role", region.get("name", "")),
-            fill=_SUCCESS,
-            anchor=tk.NW,
-            font=("Segoe UI", 9, "bold"),
-            tag="saved",
-        )
+    def _on_preview_mask(self) -> None:
+        """Show the HSV mask preview window."""
+        if self._empty_frame is None or self._full_frame is None:
+            return
+        p = self._tm.palette
+        preview = tk.Toplevel(self)
+        preview.title("HSV Mask Preview")
+        preview.configure(bg=p.bg)
 
-    # ------------------------------------------------------------------
-    # HSV threshold computation (Phase 5.3 — delegates to TwoPointCalibrationLoader)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _compute_bar_hsv_thresholds(
-        empty_img: np.ndarray,
-        full_img: np.ndarray,
-        bar_type: str = "solid_horizontal",
-        orientation: str = "left_to_right",
-    ) -> dict[str, Any]:
-        """Compute HSV calibration thresholds from empty/full bar captures.
-
-        Delegates to ``TwoPointCalibrationLoader.compute_bar_hsv_thresholds``
-        from ``bar_detector.py`` for a single source of truth.  Includes
-        ``total_length_px`` calculation, calibration sample SHA‑256 hashes,
-        and segment/radial auto‑detection.
-        """
         from src.bar_detector import TwoPointCalibrationLoader
-
-        result = TwoPointCalibrationLoader.compute_bar_hsv_thresholds(
-            empty_img=empty_img,
-            full_img=full_img,
-            bar_type=bar_type,
-            orientation=orientation,
-        )
-        return result
+        loader = TwoPointCalibrationLoader()
+        result = loader.compute(self._empty_frame, self._full_frame)
+        msg = f"Lower: {result.get('lower', 'N/A')}\nUpper: {result.get('upper', 'N/A')}"
+        tk.Label(
+            preview, text=msg, bg=p.bg, fg=p.fg,
+            font=(self._mono_font, 9), padx=12, pady=12,
+        ).pack()
+        tk.Button(
+            preview, text="Close", command=preview.destroy,
+            bg=p.accent, fg="white", font=(self._ui_font, 9),
+        ).pack(pady=(0, 6))
 
     # ------------------------------------------------------------------
-    # Public API
+    # Save / Delete / Finish
     # ------------------------------------------------------------------
 
-    def get_collected_regions(self) -> list[dict[str, Any]]:
-        """Return the list of region dicts collected so far."""
-        return list(self._collected_regions)
+    def _on_save_region(self) -> None:
+        """Save the currently drawn rectangle as a region.
+
+        Converts canvas coordinates back to source‑resolution space using
+        the current scale factor.
+        """
+        if self._rect_id is None:
+            return
+        role = self._role_var.get()
+        name = self._name_var.get().strip()
+        coords = self._canvas.coords(self._rect_id)
+        x1 = int(coords[0] / self._scale)
+        y1 = int(coords[1] / self._scale)
+        x2 = int(coords[2] / self._scale)
+        y2 = int(coords[3] / self._scale)
+        width = max(x2 - x1, 1)
+        height = max(y2 - y1, 1)
+
+        region: dict[str, Any] = {
+            "name": name,
+            "type": role,
+            "bbox": {"x": x1, "y": y1, "width": width, "height": height},
+        }
+        if role == RegionRole.COLOUR_BAR.value:
+            region["bar_type"] = self._type_var.get()
+            region["orientation"] = self._ori_var.get()
+            if self._empty_frame is not None and self._full_frame is not None:
+                region["calibration"] = {
+                    "empty_frame": self._empty_frame.tolist(),
+                    "full_frame": self._full_frame.tolist(),
+                }
+
+        self._collected_regions.append(region)
+        self._preview_text.set(f"Saved '{name}' — ({x1}, {y1}, {width}, {height})")
+        self._lbl_count.configure(text=f"Regions: {len(self._collected_regions)}")
+        self._btn_delete.configure(state=tk.DISABLED)
+        self._btn_save.configure(state=tk.DISABLED)
+        self._redraw_saved_regions()
+
+    def _on_delete(self) -> None:
+        """Delete the currently selected saved region."""
+        if self._selected_for_cal is None:
+            return
+        self._collected_regions.remove(self._selected_for_cal)
+        name = self._selected_for_cal.get("name", "unnamed")
+        self._selected_for_cal = None
+        self._btn_delete.configure(state=tk.DISABLED)
+        self._btn_save.configure(state=tk.DISABLED)
+        self._lbl_count.configure(text=f"Regions: {len(self._collected_regions)}")
+        self._preview_text.set(f"Deleted '{name}'. {len(self._collected_regions)} region(s) remaining.")
+        self._redraw_saved_regions()
+
+    def _on_finish(self) -> None:
+        """Close the tool and call on_save with collected regions."""
+        if self._on_save is not None:
+            self._on_save(list(self._collected_regions))
+        self.destroy()

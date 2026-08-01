@@ -1,11 +1,14 @@
 """
-AI Game Master - Core package.
+Ludomorph - Core package.
 
 A universal, external application that injects an autonomous LLM agent
 into any PC game by capturing the screen and simulating keyboard/mouse input.
 """
 
-__version__ = "0.2.0"
+# SINGLE SOURCE OF TRUTH for the app version.
+# Imported by main_window.py (status bar), main.py (CLI banner), etc.
+# Bump this value when cutting a new release.
+__version__ = "0.6.0"
 
 # ---------------------------------------------------------------------------
 # Phase 1 — Macro execution & Ollama health

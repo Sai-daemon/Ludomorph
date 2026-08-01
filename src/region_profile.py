@@ -23,6 +23,22 @@ logger = get_logger(__name__)
 
 _VALID_REGION_TYPES = frozenset({"color_bar", "ocr"})
 
+# Lazy import to avoid circular dependencies at module load time.
+# AnchoringConfig is only needed when a region carries anchoring data.
+_anchoring_module_loaded = False
+_AnchoringConfig: Any = None  # type: ignore[assignment]
+_AnchoringConfig_from_dict: Any = None  # type: ignore[assignment]
+
+
+def _lazy_load_anchoring() -> None:
+    """Import AnchoringConfig on first use (avoid circular import)."""
+    global _anchoring_module_loaded, _AnchoringConfig, _AnchoringConfig_from_dict
+    if not _anchoring_module_loaded:
+        from src.dynamic_region_locator import AnchoringConfig as _AC
+        _AnchoringConfig = _AC
+        _AnchoringConfig_from_dict = _AC.from_dict
+        _anchoring_module_loaded = True
+
 
 # ---------------------------------------------------------------------------
 # RegionConfig
@@ -50,6 +66,7 @@ class RegionConfig:
     preprocess: list[str] = field(default_factory=list)
     ocr_config: dict[str, Any] = field(default_factory=dict)
     calibration: dict[str, Any] = field(default_factory=dict)
+    anchoring: Any = field(default=None, repr=False)  # AnchoringConfig | None
 
     def __post_init__(self) -> None:
         if self.type not in _VALID_REGION_TYPES:
@@ -91,6 +108,8 @@ class RegionConfig:
             d["ocr"] = self.ocr_config
         if self.calibration:
             d["calibration"] = self.calibration
+        if self.anchoring is not None and hasattr(self.anchoring, "to_dict"):
+            d["anchoring"] = self.anchoring.to_dict()
         return d
 
 
@@ -106,10 +125,14 @@ class RegionProfile:
     Attributes:
         version: Version string from the JSON file.
         regions: List of validated ``RegionConfig`` entries.
+        source_resolution: (width, height) of the screenshot used during
+            calibration.  Used to scale region coordinates when working
+            with downsampled frames.  ``None`` if unknown.
     """
 
     version: str
     regions: list[RegionConfig] = field(default_factory=list)
+    source_resolution: tuple[int, int] | None = None
 
     def __iter__(self):
         return iter(self.regions)
@@ -240,6 +263,14 @@ class RegionProfile:
             ocr_config = reg.get("ocr", {})
             calibration = reg.get("calibration", {})
 
+            # Parse anchoring config if present (dynamic regions)
+            anchoring_raw = reg.get("anchoring")
+            anchoring = None
+            if anchoring_raw and isinstance(anchoring_raw, dict):
+                _lazy_load_anchoring()
+                if _AnchoringConfig_from_dict is not None:
+                    anchoring = _AnchoringConfig_from_dict(anchoring_raw)
+
             try:
                 regions.append(
                     RegionConfig(
@@ -250,6 +281,7 @@ class RegionProfile:
                         preprocess=preprocess,
                         ocr_config=ocr_config,
                         calibration=calibration,
+                        anchoring=anchoring,
                     )
                 )
             except ValueError as exc:
@@ -258,7 +290,26 @@ class RegionProfile:
         if errors:
             raise ValueError("Region profile validation errors:\n  " + "\n  ".join(errors))
 
-        profile = cls(version=version, regions=regions)
+        # Parse source_resolution if present
+        source_resolution: tuple[int, int] | None = None
+        raw_res = data.get("source_resolution")
+        if isinstance(raw_res, dict):
+            w = raw_res.get("width")
+            h = raw_res.get("height")
+            if isinstance(w, (int, float)) and isinstance(h, (int, float)) and w > 0 and h > 0:
+                source_resolution = (int(w), int(h))
+
+        # NOTE: source_resolution is NOT auto-detected from region bounds.
+        # max(x2) and max(y2) are not reliable indicators of the actual
+        # game window resolution — they just tell us the furthest pixel
+        # any region extends to.  The correct source resolution is injected
+        # by engine_bridge._async_init() from the live capture dimensions.
+
+        profile = cls(
+            version=version,
+            regions=regions,
+            source_resolution=source_resolution,
+        )
         profile_warnings = profile.validate()
         for w in profile_warnings:
             if w.startswith("WARNING:"):
@@ -270,10 +321,16 @@ class RegionProfile:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize back to a JSON‑compatible dict."""
-        return {
+        result: dict[str, Any] = {
             "version": self.version,
             "regions": [r.to_dict() for r in self.regions],
         }
+        if self.source_resolution is not None:
+            result["source_resolution"] = {
+                "width": self.source_resolution[0],
+                "height": self.source_resolution[1],
+            }
+        return result
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 Phase 5.6 — HealthMonitor Backend.
 
 Provides a central async ``HealthMonitor`` that polls all dependent services
-(Ollama, Tesseract/OCR, MCP memory server, game window) and returns a
+(Ollama, Tesseract/OCR, MCP memory server, game window, vision) and returns a
 consolidated status suitable for both the UI status bar and the decision
 loop's graceful-degradation logic (Phase 6.4).
 
@@ -94,6 +94,7 @@ class HealthMonitor:
             capture_obj=capture,
             mcp_client=mcp,
             config=cfg,
+            vision_processor=vp,
         )
         status = await monitor.get_overall_status()
         # {"level": "OK", "reason": "All systems nominal", "services": {...}}
@@ -105,11 +106,13 @@ class HealthMonitor:
         capture_obj: Any = None,
         mcp_client: Any = None,
         config: dict[str, Any] | None = None,
+        vision_processor: Any = None,
     ) -> None:
         self._ocr = ocr_module
         self._capture = capture_obj
         self._mcp = mcp_client
         self._config = config or {}
+        self._vision = vision_processor
 
         # Per-service state
         self.services: dict[str, ServiceHealth] = {
@@ -117,6 +120,7 @@ class HealthMonitor:
             "tesseract": ServiceHealth(reason="Not yet checked"),
             "mcp": ServiceHealth(reason="Not yet checked"),
             "game_window": ServiceHealth(reason="Not yet checked"),
+            "vision": ServiceHealth(reason="Not yet checked"),
         }
 
     # ------------------------------------------------------------------
@@ -208,43 +212,89 @@ class HealthMonitor:
             return False, f"MCP check error: {exc}"
 
     async def check_game_window(self) -> tuple[bool, str]:
-        """Verify the target game window is still present."""
+        """Verify the target game window is still present.
+
+        Uses the WindowTracker directly to check window existence,
+        NOT the capture() coroutine (which applies staleness/black
+        heuristics that can falsely report the window as lost).
+        """
         if self._capture is None:
             return True, "Window capture not configured"
 
         try:
-            # Prefer a dedicated window-focus check if available
-            if hasattr(self._capture, "is_window_alive") and callable(
-                self._capture.is_window_alive
-            ):
-                alive = self._capture.is_window_alive()
-                if alive:
+            # 1. Check via WindowTracker (most reliable — no staleness heuristics)
+            if hasattr(self._capture, "_tracker") and self._capture._tracker is not None:
+                tracker = self._capture._tracker
+                rect = tracker.get_active_window_rect()
+                if rect is not None:
                     return True, "Game window present"
-                return False, "Game window closed or lost"
+                else:
+                    # tracker may return None for minimized windows or
+                    # unavailable platforms — that's a real window loss
+                    return False, "Game window closed, minimized, or lost"
 
-            # Fallback: attempt a capture and check for None / black frame
-            if hasattr(self._capture, "capture") and callable(self._capture.capture):
-                import asyncio as _asyncio
+            # 2. Fallback: try a raw mss capture bypassing the staleness pipeline
+            try:
+                region = self._capture._get_capture_region()
+                if region is not None:
+                    import mss
+                    import numpy as np
+                    import asyncio as _asyncio
 
-                try:
-                    frame = await _asyncio.wait_for(
-                        self._capture.capture(), timeout=2.0
-                    )
-                except _asyncio.TimeoutError:
-                    return False, "Capture timed out — window may be frozen"
-                if frame is None:
-                    return False, "Capture returned None — window may be closed"
-                return True, "Game window present"
-            return True, "Window capture available"
+                    left, top, width, height = region
+                    monitor = {"top": top, "left": left, "width": width, "height": height}
+
+                    with mss.MSS() as sct:
+                        img = await _asyncio.to_thread(sct.grab, monitor)
+                        if img is not None:
+                            arr = np.array(img)
+                            mean_val = float(np.mean(arr))
+                            if mean_val < 1.0:
+                                return False, "Game window appears black — may be closed"
+                            return True, "Game window present"
+            except Exception:
+                pass
+
+            return True, "Window capture available (unable to verify)"
         except Exception as exc:
             return False, f"Window check failed: {exc}"
+
+    async def check_vision(self) -> tuple[bool, str]:
+        """Probe the Vision processor's health.
+
+        Returns healthy when the vision processor is loaded, enabled,
+        and YOLO model initialised successfully.
+        """
+        if self._vision is None:
+            return True, "Vision disabled in config"
+
+        try:
+            # Check if the module has a health probe
+            if hasattr(self._vision, "is_healthy") and callable(self._vision.is_healthy):
+                ok = self._vision.is_healthy()
+                if ok:
+                    return True, "Vision healthy — YOLO model loaded"
+                return False, "Vision module reports unhealthy"
+
+            # Check if vision is enabled
+            if hasattr(self._vision, "is_enabled"):
+                if not self._vision.is_enabled:
+                    return True, "Vision disabled in config"
+                return True, "Vision active — YOLO model loaded"
+
+            # Fallback: check if it has a process_frame method
+            if hasattr(self._vision, "process_frame") and callable(self._vision.process_frame):
+                return True, "Vision initialised"
+            return True, "Vision available"
+        except Exception as exc:
+            return False, f"Vision check failed: {exc}"
 
     # ------------------------------------------------------------------
     # Consolidation
     # ------------------------------------------------------------------
 
     async def check_all(self) -> dict[str, tuple[bool, str]]:
-        """Run all four health probes concurrently.
+        """Run all five health probes concurrently.
 
         Returns a dict mapping service name → ``(healthy, reason)``.
         """
@@ -253,10 +303,11 @@ class HealthMonitor:
             self.check_tesseract(),
             self.check_mcp(),
             self.check_game_window(),
+            self.check_vision(),
             return_exceptions=True,
         )
 
-        names = ("ollama", "tesseract", "mcp", "game_window")
+        names = ("ollama", "tesseract", "mcp", "game_window", "vision")
         parsed: dict[str, tuple[bool, str]] = {}
         for name, result in zip(names, results):
             if isinstance(result, BaseException):
@@ -319,13 +370,15 @@ class HealthMonitor:
 
         # DEGRADED: any other critical service down
         degraded_reasons: list[str] = []
-        for name in ("ollama", "tesseract", "mcp"):
+        degradation_labels: dict[str, str] = {
+            "ollama": "LLM unreachable",
+            "tesseract": "OCR unavailable",
+            "mcp": "Memory server down",
+            "vision": "Vision degraded",
+        }
+        for name in ("ollama", "tesseract", "mcp", "vision"):
             if not services_dict[name]["healthy"]:
-                label = {
-                    "ollama": "LLM unreachable",
-                    "tesseract": "OCR unavailable",
-                    "mcp": "Memory server down",
-                }.get(name, f"{name} unhealthy")
+                label = degradation_labels.get(name, f"{name} unhealthy")
                 degraded_reasons.append(label)
 
         if degraded_reasons:

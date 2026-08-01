@@ -48,6 +48,8 @@ from src.ocr_module import OCRModule, OCRResult
 from src.state_hash import StateCache, state_hash
 
 if TYPE_CHECKING:
+    from src.dynamic_region_locator import AnchoringConfig as AnchoringConfig_t
+    from src.dynamic_region_locator import DynamicRegionLocator as DynamicRegionLocator_t
     from src.region_profile import RegionConfig, RegionProfile
 
 logger = get_logger(__name__)
@@ -188,6 +190,7 @@ class StateProcessor:
         *,
         metrics: PipelineMetrics | None = None,
         vision_interval: int = 2,
+        dynamic_region_locator: "DynamicRegionLocator_t | None" = None,
     ) -> None:
         self._profile = profile
         self._ocr = ocr_module
@@ -195,6 +198,7 @@ class StateProcessor:
         self._cache = StateCache(ttl=cache_ttl)
         self._metrics = metrics or PipelineMetrics()
         self._vision_interval = vision_interval
+        self._dynamic_locator = dynamic_region_locator
 
         # Build one detector per colour-bar region
         self._colour_detectors: dict[str, ColourBarDetector] = {}
@@ -532,6 +536,14 @@ class StateProcessor:
     ) -> dict[str, OCRResult]:
         """Run all OCR recognitions concurrently with an aggregate timeout.
 
+        For static regions the configured bounds are used directly,
+        automatically scaled to match the current frame resolution.
+
+        For dynamic regions (those with ``anchoring`` set) the
+        ``DynamicRegionLocator`` resolves runtime bounds; OCR is then run
+        on each resolved sub‑region and the best (highest‑confidence)
+        result is kept, labelled with the region name.
+
         Records the batch latency to ``self._metrics`` for the vision-OCR
         scheduling gate (§7.7A).
 
@@ -541,11 +553,88 @@ class StateProcessor:
         if not ocr_regions:
             return {}
 
-        tasks = [
-            self._ocr.recognize_region(frame, region)
-            for region in ocr_regions
-        ]
+        h, w = frame.shape[:2]
 
+        # ------------------------------------------------------------------
+        # 1. Resolve dynamic regions first (must happen before OCR dispatch
+        #    because resolution may depend on vision/motion data that is
+        #    refreshed this frame).
+        # ------------------------------------------------------------------
+        dynamic_tasks: list[tuple[str, "RegionConfig", list["AnchoringConfig_t"]]] = []
+        """List of (region_name, region_config, [resolved_overrides])."""
+        locator = self._dynamic_locator
+
+        for region in ocr_regions:
+            anchoring = getattr(region, "anchoring", None)
+            if anchoring is None or anchoring.mode == "static":
+                continue  # handled by standard path below
+            if locator is None:
+                logger.warning(
+                    f"Region '{region.name}' has anchoring but no "
+                    f"DynamicRegionLocator is wired — skipping"
+                )
+                continue
+            try:
+                resolved = await locator.resolve(anchoring, frame)
+                if resolved:
+                    # Build a list of (bounds, override_name) tuples for this region
+                    dynamic_tasks.append(
+                        (region.name, region, resolved)
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"Dynamic locator failed for '{region.name}' ({anchoring.mode}): {exc}"
+                )
+
+        # ------------------------------------------------------------------
+        # 2. Build the task list:
+        #    - One task per static region with scaled bounds
+        #    - One task per resolved dynamic sub‑region (override bounds)
+        #    Track mapping back to region names for result aggregation.
+        # ------------------------------------------------------------------
+        tasks: list[asyncio.Task[OCRResult]] = []
+        task_metadata: list[tuple[str, str, bool]] = []
+        """(region_name, result_key, is_dynamic_sub) for each task."""
+
+        # Static regions — apply coordinate scaling from source resolution
+        static_regions = [
+            r for r in ocr_regions
+            if getattr(r, "anchoring", None) is None
+            or getattr(r, "anchoring", None).mode == "static"
+        ]
+        for region in static_regions:
+            scaled_bounds = self._scale_bounds_for_frame(region.bounds, w, h)
+            task_metadata.append((region.name, region.name, False))
+            tasks.append(
+                asyncio.ensure_future(
+                    self._ocr.recognize_region(
+                        frame, region, override_bounds=scaled_bounds
+                    )
+                )
+            )
+
+        # Dynamic sub‑regions
+        for region_name, region, resolved_list in dynamic_tasks:
+            for i, rr in enumerate(resolved_list):
+                sub_key = f"{region_name}#sub{i}"
+                task_metadata.append((region_name, sub_key, True))
+                tasks.append(
+                    asyncio.ensure_future(
+                        self._ocr.recognize_region(
+                            frame,
+                            region,
+                            override_bounds=rr.bounds,
+                            override_name=rr.label,
+                        )
+                    )
+                )
+
+        if not tasks:
+            return {}
+
+        # ------------------------------------------------------------------
+        # 3. Execute all tasks with aggregate timeout
+        # ------------------------------------------------------------------
         _t0 = time.monotonic()
         try:
             results_list = await asyncio.wait_for(
@@ -564,15 +653,39 @@ class StateProcessor:
             _elapsed_ms = (time.monotonic() - _t0) * 1000
             self._metrics.record_ocr_latency(_elapsed_ms)
 
-        output: dict[str, OCRResult] = {}
-        for region, result in zip(ocr_regions, results_list):
+        # ------------------------------------------------------------------
+        # 4. Aggregate results: for each region name, keep the best
+        #    sub‑result (highest confidence).  Static regions map directly.
+        # ------------------------------------------------------------------
+        # First pass: collect per‑region candidates
+        region_candidates: dict[str, list[OCRResult]] = {}
+        for (meta_region_name, result_key, is_dynamic), result in zip(
+            task_metadata, results_list
+        ):
             if isinstance(result, Exception):
-                logger.warning(f"OCR failed for '{region.name}': {result}")
+                logger.warning(f"OCR failed for '{result_key}': {result}")
+                continue
+            if not isinstance(result, OCRResult):
+                continue
+            region_candidates.setdefault(meta_region_name, []).append(result)
+
+        # Second pass: pick best for each region
+        output: dict[str, OCRResult] = {}
+        for region in ocr_regions:
+            candidates = region_candidates.get(region.name, [])
+            if not candidates:
                 output[region.name] = OCRResult.empty(region.name)
-            elif isinstance(result, OCRResult):
-                output[region.name] = result
-            else:
-                output[region.name] = OCRResult.empty(region.name)
+                continue
+
+            # Prefer success and highest confidence
+            best = max(
+                candidates,
+                key=lambda r: (r.success, r.confidence),
+            )
+            # Re‑label the winner with the canonical region name for the
+            # slot resolver to match against.
+            best.region_name = region.name
+            output[region.name] = best
 
         return output
 
@@ -618,14 +731,49 @@ class StateProcessor:
     # Helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _crop_roi(frame: np.ndarray, region: "RegionConfig") -> np.ndarray | None:
-        """Safely crop *region.bounds* from *frame*.
+    def _scale_bounds_for_frame(
+        self, bounds: tuple[int, int, int, int], frame_w: int, frame_h: int
+    ) -> tuple[int, int, int, int]:
+        """Scale region bounds from source resolution to the given frame size.
+
+        Returns the original bounds unchanged when ``source_resolution`` is
+        not set or already matches *frame_w* × *frame_h*.
+        """
+        src_res = self._profile.source_resolution
+        if src_res is None or (src_res[0] == frame_w and src_res[1] == frame_h):
+            return bounds
+
+        scale_x = frame_w / src_res[0]
+        scale_y = frame_h / src_res[1]
+        return (
+            int(bounds[0] * scale_x),
+            int(bounds[1] * scale_y),
+            int(bounds[2] * scale_x),
+            int(bounds[3] * scale_y),
+        )
+
+    def _crop_roi(
+        self, frame: np.ndarray, region: "RegionConfig"
+    ) -> np.ndarray | None:
+        """Safely crop *region.bounds* from *frame*, applying coordinate
+        scaling when the frame resolution differs from the calibration
+        source resolution.
 
         Returns ``None`` if the bounds are entirely out‑of‑range.
         """
         x1, y1, x2, y2 = region.bounds
         h, w = frame.shape[:2]
+
+        # --- Coordinate scaling -----------------------------------------------
+        src_res = self._profile.source_resolution
+        if src_res is not None and (src_res[0] != w or src_res[1] != h):
+            scale_x = w / src_res[0]
+            scale_y = h / src_res[1]
+            x1 = int(x1 * scale_x)
+            y1 = int(y1 * scale_y)
+            x2 = int(x2 * scale_x)
+            y2 = int(y2 * scale_y)
+        # --------------------------------------------------------------------
 
         # Clamp to frame dimensions
         x1 = max(0, min(x1, w - 1))

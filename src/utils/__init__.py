@@ -1,1 +1,1 @@
-"""Utility modules for AI Game Master."""
+"""Utility modules for Ludomorph."""

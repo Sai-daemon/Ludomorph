@@ -191,18 +191,23 @@ def build_llm_prompt(
         # Phase 4.4 — vision‑aware system prompt: tell the LLM it can
         # target detected objects via dynamic macros.
         system_prompt = (
-            "You are a game AI agent. Respond ONLY with a JSON object containing "
-            f"an \"action\" field from: {', '.join(macro_names)}.\n"
+            "You are a game-playing AI. Your ONLY output must be a single JSON object "
+            "with exactly one key \"action\". The value must be one of: "
+            f"{', '.join(macro_names)}.\n"
             "If a targetable object is detected, you may use a dynamic macro "
-            "that targets that object (e.g. \"dynamic_click\" with the object's "
-            "class name).  Prefer static macros when no target is needed.\n"
-            "No extra words, no explanations."
+            "that targets that object. Prefer static macros when no target is needed.\n"
+            "Do NOT output any text before or after the JSON. "
+            "Do NOT add extra fields, reasoning, or explanation. "
+            "Example: {\"action\": \"" + macro_names[0] + "\"}"
         )
     else:
         system_prompt = (
-            "You are a game AI agent. Respond ONLY with a JSON object containing "
-            f"an \"action\" field from: {', '.join(macro_names)}.\n"
-            "No extra words, no explanations."
+            "You are a game-playing AI. Your ONLY output must be a single JSON object "
+            "with exactly one key \"action\". The value must be one of: "
+            f"{', '.join(macro_names)}.\n"
+            "Do NOT output any text before or after the JSON. "
+            "Do NOT add extra fields, reasoning, or explanation. "
+            "Example: {\"action\": \"" + macro_names[0] + "\"}"
         )
 
     system_tokens = count_tokens(system_prompt)

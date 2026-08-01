@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI Game Master - Main entry point.
+Ludomorph - Main entry point.
 
 A universal, external application that injects an autonomous LLM agent
 into any PC game by capturing the screen and simulating keyboard/mouse input.
@@ -97,7 +97,7 @@ def main() -> None:
     # 0. Parse CLI arguments
     # ------------------------------------------------------------------
     parser = argparse.ArgumentParser(
-        description="AI Game Master — universal LLM agent for any PC game.",
+        description="Ludomorph — universal LLM agent for any PC game.",
     )
     parser.add_argument(
         "--check",
@@ -154,7 +154,7 @@ def main() -> None:
     # Install crash-forensics hook as early as possible
     _install_excepthook()
 
-    logger.info(f"AI Game Master v{__version__} starting up ...")
+    logger.info(f"Ludomorph v{__version__} starting up ...")
 
     if args.check_only:
         logger.info("Running in CHECK mode — no macros will be executed.")

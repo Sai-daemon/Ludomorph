@@ -1,5 +1,5 @@
 #
-# AI Game Master - requirements.txt
+# Ludomorph - requirements.txt
 # Step 1.1: Project skeleton with all fixed dependencies
 #
 # Standard library (NOT listed here): tkinter, asyncio, json, sqlite3, subprocess,
@@ -21,7 +21,11 @@ pyautogui>=0.9.54       # Fallback only
 
 # --- OCR ---
 pytesseract>=0.3.10     # Tesseract wrapper (no aiopytesseract)
-Pillow>=10.0.0          # PIL.Image for OCR preprocessing
+Pillow>=10.0.0          # PIL.Image for OCR preprocessing; also needs:
+#   Debian/Ubuntu: sudo apt install python3-pil.imagetk   (PIL.ImageTk for tkinter)
+#   Fedora:        sudo dnf install python3-pillow-tk
+#   Arch:          sudo pacman -S python-pillow
+#   Windows/macOS: included with Pillow wheel
 
 # --- Image Processing ---
 opencv-python>=4.9.0

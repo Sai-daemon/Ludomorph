@@ -37,8 +37,17 @@ _TCP_CHECK_PER_ATTEMPT: float = 0.5
 _HEALTH_CHECK_TIMEOUT: float = 2.0
 _POLL_DELAY: float = 0.2
 _PERIODIC_HEALTH_INTERVAL: float = 10.0
-_MAX_RESTART_ATTEMPTS: int = 1
+_MAX_RESTART_ATTEMPTS: int = 3
 _PROCESS_TREE_CLEANUP_TIMEOUT: float = 3.0
+
+_STARTUP_MAX_RETRIES: int = 3
+"""Maximum retry attempts when the server fails to become ready during start()."""
+
+_STARTUP_BASE_DELAY: float = 1.0
+"""Base delay (seconds) for exponential backoff during startup retries."""
+
+_MONITOR_BASE_DELAY: float = 1.0
+"""Base delay (seconds) for exponential backoff between monitor restart attempts."""
 
 
 # ---------------------------------------------------------------------------
@@ -150,17 +159,24 @@ class MCPServerManager:
         Sets security environment variables, launches the subprocess,
         then runs the 2‑phase health check (TCP port → HTTP health
         endpoint).  A background monitor task is started to detect
-        unexpected death and attempt a single restart.
+        unexpected death and attempt up to 3 restarts with exponential
+        backoff.
+
+        On startup failure the method retries with exponential backoff
+        (1 s → 2 s → 4 s) up to *STARTUP_MAX_RETRIES* attempts before
+        raising.
 
         Raises:
-            RuntimeError: If the server fails to become ready within
-                *ready_timeout* seconds.  The caller should catch this
-                and degrade gracefully (memory tier disabled).
+            RuntimeError: If the server fails to become ready after all
+                retry attempts.  The caller should catch this and
+                degrade gracefully (memory tier disabled).
         """
         logger.info(
-            "Starting MCP memory server on port {} (ready timeout {:.1f}s) …",
+            "Starting MCP memory server on port {} (ready timeout {:.1f}s, "
+            "max retries {}) …",
             self.port,
             self.ready_timeout,
+            _STARTUP_MAX_RETRIES,
         )
 
         # Security pinning (architecture.md §6.2) + disable CUDA to skip
@@ -180,21 +196,59 @@ class MCPServerManager:
             "--http",
         ]
 
-        self.process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
+        last_error: str = ""
+
+        for attempt in range(_STARTUP_MAX_RETRIES + 1):
+            if attempt > 0:
+                delay = _STARTUP_BASE_DELAY * (2 ** (attempt - 1))
+                logger.info(
+                    "MCP startup retry {}/{} after {:.1f}s delay …",
+                    attempt,
+                    _STARTUP_MAX_RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+            self.process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+
+            try:
+                await self._wait_for_ready()
+            except RuntimeError as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "MCP startup attempt {}/{} failed: {}",
+                    attempt + 1,
+                    _STARTUP_MAX_RETRIES + 1,
+                    last_error,
+                )
+                # Clean up the failed process before retrying
+                if self.process is not None:
+                    await self._shutdown_process(self.process)
+                    pid = self.process.pid
+                    if pid is not None:
+                        kill_process_tree(pid)
+                    self.process = None
+                continue  # retry
+
+            # --- Success path ---
+            # Start background monitor + stderr reader
+            self._monitor_task = asyncio.create_task(self._monitor())
+            self._stderr_task = asyncio.create_task(self._read_stderr())
+
+            logger.info("MCP memory server ready on port {}.", self.port)
+            return
+
+        # All retries exhausted
+        raise RuntimeError(
+            f"MCP memory server failed to start after "
+            f"{_STARTUP_MAX_RETRIES + 1} attempts. "
+            f"Last error: {last_error}"
         )
-
-        # Wait for readiness
-        await self._wait_for_ready()
-
-        # Start background monitor + stderr reader
-        self._monitor_task = asyncio.create_task(self._monitor())
-        self._stderr_task = asyncio.create_task(self._read_stderr())
-
-        logger.info("MCP memory server ready on port {}.", self.port)
 
     async def stop(self) -> None:
         """Gracefully shut down the server and clean up child processes.
@@ -275,8 +329,9 @@ class MCPServerManager:
     async def _monitor(self) -> None:
         """Background task — detect unexpected death and attempt restart.
 
-        If the server dies (returncode != 0), one automatic restart is
-        attempted.  On second failure the memory tier is disabled.
+        If the server dies (returncode != 0), up to ``_MAX_RESTART_ATTEMPTS``
+        restarts are attempted with exponential backoff.  After exhausting
+        all retries the memory tier is permanently disabled.
         """
         assert self.process is not None
 
@@ -305,12 +360,17 @@ class MCPServerManager:
                 self.process = None
                 return
 
+            # Exponential backoff: 1s → 2s → 4s
+            delay = _MONITOR_BASE_DELAY * (2 ** restart_attempts)
             restart_attempts += 1
             logger.info(
-                "Restarting MCP memory server (attempt {}/{}) …",
+                "Restarting MCP memory server (attempt {}/{}) "
+                "after {:.1f}s delay …",
                 restart_attempts,
                 _MAX_RESTART_ATTEMPTS,
+                delay,
             )
+            await asyncio.sleep(delay)
 
             env = {**os.environ}
             env.setdefault("MCP_ALLOW_ANONYMOUS_ACCESS", "true")

@@ -11,6 +11,9 @@ __pycache__/
 dist/
 build/
 
+# Tests
+tests/
+
 # IDE
 .idea/
 .vscode/

@@ -406,33 +406,85 @@ class WindowFocusManager:
 
     async def _focus_gnome(self, title: str) -> FocusResult:
         """
-        GNOME window focus — stub for Phase 1.4.
+        GNOME window focus via the 'Activate Window By Title' extension
+        (DBus: de.lucaswerkmeister.ActivateWindowByTitle).
 
-        Full implementation requires the 'Activate Window By Title' extension
-        (DBus: de.lucaswerkmeister.ActivateWindowByTitle).  This stub detects
-        whether the extension is available; if not, it logs setup instructions
-        and falls back to click-to-focus.
+        Attempts gdbus activation first; if the extension is unavailable,
+        falls back to click-to-focus with setup instructions.
         """
         # Check if the GNOME extension DBus interface exists
         dbus_available = await self._check_gnome_extension()
 
         if dbus_available:
-            # Extension is installed — attempt activation (stub: log intent)
-            logger.info(
-                f"GNOME extension detected. Would activate window: {title!r} "
-                f"(full DBus activation deferred to Phase 5/6)."
-            )
-            # TODO (Phase 5/6): call gdbus activateByTitle
-            # For now, fall back to click-to-focus
-            return await self._focus_fallback(title)
+            return await self._focus_gnome_dbus(title)
 
         logger.warning(
             "GNOME auto-focus requires the 'Activate Window By Title' extension.\n"
-            "  Install it from: https://extensions.gnome.org/extension/...\n"
-            "  Or run: sudo apt install gnome-shell-extension-activate-window (if packaged)\n"
+            "  Install it from: https://extensions.gnome.org/extension/5021/activate-window-by-title/\n"
+            "  Or your distribution's package manager (e.g., gnome-shell-extension-activate-window).\n"
             "Falling back to ydotool click-to-focus (unreliable)."
         )
         return await self._focus_fallback(title)
+
+    async def _focus_gnome_dbus(self, title: str) -> FocusResult:
+        """Execute the gdbus activateByTitle call for GNOME."""
+        if not shutil.which("gdbus"):
+            return FocusResult(
+                success=False,
+                method="gnome_dbus",
+                compositor="gnome",
+                message="gdbus binary not found on $PATH.",
+            )
+        try:
+            cmd = [
+                "gdbus", "call", "--session",
+                "--dest", "de.lucaswerkmeister.ActivateWindowByTitle",
+                "--object-path", "/de/lucaswerkmeister/ActivateWindowByTitle",
+                "--method", "de.lucaswerkmeister.ActivateWindowByTitle.activateByTitle",
+                title,
+            ]
+            logger.debug(f"Running: {' '.join(cmd)}")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                err = stderr.decode().strip() if stderr else f"exit code {proc.returncode}"
+                logger.warning(f"GNOME gdbus activation failed: {err}")
+                return await self._focus_fallback(title)
+
+            # Parse the boolean return: "(<true>,)" or "(<false>,)" etc.
+            output = stdout.decode().strip()
+            logger.debug(f"GNOME gdbus output: {output!r}")
+
+            if "true" in output.lower():
+                logger.info(f"GNOME window activated via gdbus: {title!r}")
+                return FocusResult(
+                    success=True,
+                    method="gnome_dbus",
+                    compositor="gnome",
+                    message=f"Focused window via GNOME extension: {title!r}",
+                )
+
+            logger.warning(
+                f"GNOME gdbus returned false for title {title!r} — "
+                f"window may not exist or extension may need updating."
+            )
+            return await self._focus_fallback(title)
+
+        except FileNotFoundError:
+            return FocusResult(
+                success=False,
+                method="gnome_dbus",
+                compositor="gnome",
+                message="gdbus not found on PATH.",
+            )
+        except Exception as exc:
+            logger.warning(f"GNOME gdbus error: {exc}")
+            return await self._focus_fallback(title)
 
     async def _check_gnome_extension(self) -> bool:
         """Return True if the ActivateWindowByTitle DBus interface is present."""
@@ -459,32 +511,122 @@ class WindowFocusManager:
 
     async def _focus_kde(self, title: str) -> FocusResult:
         """
-        KDE Plasma window focus — stub for Phase 1.4.
+        KDE Plasma window focus via the bundled KWin script
+        (DBus: org.kde.KWin.WindowActivator).
 
-        Full implementation requires a custom KWin script (provided as a
-        resource in resources/kwin/gameai-activator/).  This stub checks
-        whether the script's DBus method is available; if not, it logs
-        setup instructions and falls back to click-to-focus.
+        If the KWin script is detected, calls qdbus activateWindow.
+        If the script is not installed, attempts to auto-copy it to
+        ~/.local/share/kwin/scripts/ and instructs the user to enable it.
+        Falls back to click-to-focus in all other cases.
         """
         dbus_available = await self._check_kde_script()
 
         if dbus_available:
-            logger.info(
-                f"KDE KWin script detected. Would activate window: {title!r} "
-                f"(full DBus activation deferred to Phase 5/6)."
-            )
-            # TODO (Phase 5/6): call qdbus activateWindow
-            return await self._focus_fallback(title)
+            return await self._focus_kde_dbus(title)
+
+        # Script not installed — attempt auto-deployment
+        deployed = await self._deploy_kde_script()
+        if deployed:
+            logger.info("KDE KWin script deployed — user must still enable it.")
+        else:
+            logger.warning("Could not deploy KDE KWin script automatically.")
 
         logger.warning(
             "KDE auto-focus requires the GameAI KWin script to be enabled.\n"
-            "  1. The script is bundled at: resources/kwin/gameai-activator/\n"
-            "  2. Copy to: ~/.local/share/kwin/scripts/gameai-activator/\n"
-            "  3. Enable in System Settings → Window Management → KWin Scripts\n"
-            "  4. Log out and back in.\n"
+            "  1. The script has been copied to: ~/.local/share/kwin/scripts/gameai-activator/\n"
+            "  2. Go to System Settings → Window Management → KWin Scripts\n"
+            "  3. Enable 'GameAI Activator' and click Apply\n"
+            "  4. Log out and back in (or run: systemctl restart --user plasma-kwin_wayland)\n"
             "Falling back to ydotool click-to-focus (unreliable)."
         )
         return await self._focus_fallback(title)
+
+    async def _focus_kde_dbus(self, title: str) -> FocusResult:
+        """Execute the qdbus activateWindow call for KDE."""
+        if not shutil.which("qdbus"):
+            return FocusResult(
+                success=False,
+                method="kde_dbus",
+                compositor="kde",
+                message="qdbus binary not found on $PATH.",
+            )
+        try:
+            cmd = [
+                "qdbus", "org.kde.KWin", "/WindowActivator",
+                "org.kde.KWin.WindowActivator.activateWindow",
+                title,
+            ]
+            logger.debug(f"Running: {' '.join(cmd)}")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                err = stderr.decode().strip() if stderr else f"exit code {proc.returncode}"
+                logger.warning(f"KDE qdbus activation failed: {err}")
+                return await self._focus_fallback(title)
+
+            output = stdout.decode().strip()
+            logger.debug(f"KDE qdbus output: {output!r}")
+
+            # The KWin script returns a boolean — check for true/false
+            if output.lower() == "true":
+                logger.info(f"KDE window activated via qdbus: {title!r}")
+                return FocusResult(
+                    success=True,
+                    method="kde_dbus",
+                    compositor="kde",
+                    message=f"Focused window via KDE KWin script: {title!r}",
+                )
+
+            logger.warning(
+                f"KDE qdbus returned {output!r} for title {title!r} — "
+                f"window may not exist or KWin script may need reloading."
+            )
+            return await self._focus_fallback(title)
+
+        except FileNotFoundError:
+            return FocusResult(
+                success=False,
+                method="kde_dbus",
+                compositor="kde",
+                message="qdbus not found on PATH.",
+            )
+        except Exception as exc:
+            logger.warning(f"KDE qdbus error: {exc}")
+            return await self._focus_fallback(title)
+
+    async def _deploy_kde_script(self) -> bool:
+        """Copy the bundled KWin script to the user's KWin scripts directory.
+
+        Returns True if the copy succeeded, False otherwise.
+        """
+        import pathlib
+
+        # Resolve the source directory relative to this source file
+        src_dir = pathlib.Path(__file__).resolve().parent.parent / "resources" / "kwin" / "gameai-activator"
+        dest_dir = pathlib.Path.home() / ".local" / "share" / "kwin" / "scripts" / "gameai-activator"
+
+        if not src_dir.exists():
+            logger.warning(f"KWin script source not found at {src_dir}")
+            return False
+
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            for item in src_dir.iterdir():
+                dest_item = dest_dir / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest_item, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, dest_item)
+            logger.info(f"KWin script deployed to {dest_dir}")
+            return True
+        except OSError as exc:
+            logger.warning(f"Failed to deploy KWin script: {exc}")
+            return False
 
     async def _check_kde_script(self) -> bool:
         """Return True if the GameAI KWin script DBus interface is present."""

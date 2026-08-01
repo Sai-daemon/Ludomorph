@@ -50,9 +50,16 @@ logger = get_logger(__name__)
 # Default fallback action when nothing else is available.
 _DEFAULT_FALLBACK: str = "WAIT"
 
-# Regex to extract a JSON object from garbled LLM output (fallback parsing).
+# Regex to extract a valid JSON object from potentially garbled LLM output.
+# Matches the LAST occurrence of {"action": "MACRO_NAME"} in the text.
 _JSON_EXTRACT_RE: re.Pattern[str] = re.compile(
     r'\{\s*"action"\s*:\s*"([^"]+)"\s*\}'
+)
+
+# Regex to find ANY complete JSON object in the response (not just action-keyed).
+# Used as a second-level fallback when the action-keyed regex fails.
+_ANY_JSON_OBJECT_RE: re.Pattern[str] = re.compile(
+    r'\{[^{}]*\}'
 )
 
 # ---------------------------------------------------------------------------
@@ -106,8 +113,10 @@ def parse_llm_response(
 ) -> str | None:
     """Parse a raw LLM response string into a validated macro name.
 
-    Tries strict JSON parsing first, then falls back to regex extraction.
-    Returns ``None`` if the response cannot be mapped to a valid macro.
+    Tries strict JSON parsing first, then the ``"action"``-keyed regex,
+    then attempts to extract any JSON object and look for known keys
+    (``action``, ``macro``, ``choice``, ``name``), then falls back to
+    scanning individual words for a valid macro name.
 
     Args:
         response_text: The raw ``content`` string from the LLM response
@@ -122,37 +131,82 @@ def parse_llm_response(
 
     text = response_text.strip()
 
-    # 1) Strict JSON parse
+    # ------------------------------------------------------------------
+    # 1) Strict JSON parse — try the whole string first
+    # ------------------------------------------------------------------
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, TypeError):
         parsed = None
 
-    if isinstance(parsed, dict) and "action" in parsed:
-        action = str(parsed["action"]).strip()
-        if action in valid_macros:
+    if isinstance(parsed, dict):
+        action = _extract_action_from_dict(parsed, valid_macros)
+        if action is not None:
             return action
-        else:
+
+    # ------------------------------------------------------------------
+    # 2) Action-keyed regex — handles JSON with trailing garbage
+    #    e.g. '{"action": "ATTACK"}\n\nExtra rambling...'
+    # ------------------------------------------------------------------
+    # findall returns all matches; prefer the LAST one (model often
+    # emits reasoning then the final answer).
+    matches = _JSON_EXTRACT_RE.findall(text)
+    if matches:
+        action = matches[-1].strip()
+        if action in valid_macros:
             logger.debug(
-                "LLM returned unknown action {!r} (allowed: {})",
-                action,
-                sorted(valid_macros),
+                "Regex-extracted action {!r} from LLM response", action
             )
-
-    # 2) Fallback regex extraction
-    match = _JSON_EXTRACT_RE.search(text)
-    if match:
-        action = match.group(1).strip()
-        if action in valid_macros:
-            logger.debug("Regex-extracted action {!r} from garbled LLM response", action)
             return action
 
-    # 3) If the entire string is a single word that matches a macro
-    single_word = text.split()[0].strip().upper()
-    if single_word in valid_macros:
-        logger.debug("Single-word fallback action {!r}", single_word)
-        return single_word
+    # ------------------------------------------------------------------
+    # 3) Any-JSON-object extraction — handles multi-field JSON where
+    #    "action" might be named differently (e.g. "macro", "choice")
+    # ------------------------------------------------------------------
+    json_matches = _ANY_JSON_OBJECT_RE.findall(text)
+    for candidate in reversed(json_matches):  # try last JSON objects first
+        try:
+            obj = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            action = _extract_action_from_dict(obj, valid_macros)
+            if action is not None:
+                logger.debug(
+                    "Extracted action {!r} from alternate JSON key in LLM response",
+                    action,
+                )
+                return action
 
+    # ------------------------------------------------------------------
+    # 4) Single-word scan — iterate ALL words for a valid macro name
+    #    (much smarter than just checking the first word)
+    # ------------------------------------------------------------------
+    for word in text.split():
+        candidate = word.strip().strip('"\'').upper()
+        if candidate in valid_macros:
+            logger.debug("Word-scan fallback action {!r}", candidate)
+            return candidate
+
+    return None
+
+
+def _extract_action_from_dict(
+    obj: dict[str, object],
+    valid_macros: set[str],
+) -> str | None:
+    """Try to extract a valid macro name from a parsed JSON dict.
+
+    Checks the following keys in order: ``action``, ``macro``, ``choice``,
+    ``name``.  Returns the first value that matches a name in
+    *valid_macros*, or ``None``.
+    """
+    for key in ("action", "macro", "choice", "name"):
+        value = obj.get(key)
+        if isinstance(value, str):
+            action = value.strip()
+            if action in valid_macros:
+                return action
     return None
 
 
@@ -200,17 +254,24 @@ async def call_llm_decision(
     if not valid_names:
         valid_names = {_DEFAULT_FALLBACK}
 
-    # Build request payload — do NOT use "format": "json" because
-    # phi3.5 models do not support the Ollama structured output
-    # feature (requires Ollama >= 0.5.0 and specific model support).
-    # The parse_llm_response() fallback chain (JSON → regex → single-word)
-    # handles extraction from raw text reliably.
+    # Build request payload.
+    #
+    # Use "format": "json" to force the model to emit valid JSON.
+    # This works with Ollama >= 0.2.0 and prevents the most common
+    # garbage-response pattern (JSON mixed with commentary / instruction
+    # fragments).  The parse_llm_response() fallback chain below still
+    # handles broken JSON should it occur.
+    #
+    # num_predict=30 gives the model enough room to emit a complete
+    # JSON object plus a safety margin.  Previous value of 15 caused
+    # truncation when the model emitted extra fields.
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
+        "format": "json",
         "options": {
             "temperature": 0,
-            "num_predict": 15,
+            "num_predict": 30,
             "num_ctx": 4096,
         },
         "stream": False,

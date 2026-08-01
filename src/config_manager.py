@@ -30,10 +30,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ollama_url": "http://localhost:11434/v1",
     "ollama_model": "phi3.5:3.8b-mini-instruct-q4_K_M",
     "mcp_url": "http://localhost:8000",
-    "summarization_model": "phi3.5:mini",
+    "mcp_enabled": True,
+    "summarization_model": "phi3.5:3.8b-mini-instruct-q4_K_M",
     "memory_max_events": 10000,
     "enable_summarization": True,
     "action_cooldown_ms": 150,
+    "llm_timeout_ms": 200,
+    "llm_max_tokens": 800,
+    "llm_vision_max_tokens": 1000,
+    "frame_skip": 0,
     "diff": {
         "downsample_width": 640,
         "downsample_height": 360,
@@ -53,8 +58,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "state_cache_ttl_seconds": 0.3,
     "ocr_cache_ttl_seconds": 2.0,
     "auto_focus_window": True,
+    "window_title": None,
+    "capture_region": None,
     "log_level": "INFO",
     "input_backend": "auto",
+    "mouse_speed": 1.0,
+    "theme": "auto",
+    "theme_custom_bg": None,
     "vision": {
         "enabled": False,
         "model_path": "models/yolo11n.onnx",
@@ -66,6 +76,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "backend": "auto",
         "input_size": 640,
     },
+    "player_anchor": None,
 }
 
 DEFAULT_MACROS: list[dict[str, Any]] = []

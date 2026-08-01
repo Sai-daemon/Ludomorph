@@ -322,6 +322,112 @@ class InputController:
         except Exception as exc:
             raise InputError(f"move_mouse({x}, {y}, relative={relative}) failed: {exc}") from exc
 
+    async def move_mouse_smooth(
+        self, x: int, y: int, speed: float = 1.0, relative: bool = False,
+    ) -> None:
+        """
+        Move the mouse cursor smoothly using linear interpolation.
+
+        Speed controls the movement pace on a 0.0–2.0 scale:
+
+        - ``0.0`` → Slow (~600 px/s, human-like deliberate movement)
+        - ``1.0`` → Normal (~3000 px/s, faster than human but visibly smooth)
+        - ``2.0`` → Fast / Instant (teleports directly, no interpolation)
+
+        Values between these snap points scale linearly.  The method reads
+        the current cursor position, computes the straight-line distance,
+        divides it into micro-steps, and moves incrementally with small
+        sleeps so the event loop is not starved.
+
+        If *relative* is True, *x* and *y* are treated as deltas from the
+        current position.
+
+        Raises InputError on failure (falls back to instant move if the
+        current position cannot be read).
+        """
+        if speed >= 2.0:
+            # Instant / teleport — delegate to the normal move
+            await self.move_mouse(x, y, relative=relative)
+            return
+
+        # Read current cursor position -------------------------------------------------
+        try:
+            cx, cy = await self._get_current_mouse_position()
+        except Exception:
+            # Cannot read position — fall back to instant move
+            logger.debug("Cannot read mouse position; falling back to instant move.")
+            await self.move_mouse(x, y, relative=relative)
+            return
+
+        # Compute target -----------------------------------------------------------------
+        if relative:
+            target_x = cx + x
+            target_y = cy + y
+        else:
+            target_x = x
+            target_y = y
+
+        # Early exit if already at target
+        if cx == target_x and cy == target_y:
+            return
+
+        # Compute distance and step count ------------------------------------------------
+        import math
+
+        dist = math.hypot(target_x - cx, target_y - cy)
+        if dist < 1.0:
+            await self.move_mouse(target_x, target_y, relative=False)
+            return
+
+        # Base pixels-per-second mapped from speed (0.0→600, 1.0→3000, 2.0→instant)
+        base_pps = 600.0 + (speed / 2.0) * (3000.0 - 600.0) * 2.0  # linear: 600→3000→6000
+        # Step interval: target ~120 updates/s for smoothness, but at least 2 steps
+        steps_per_second = 120.0
+        step_interval = 1.0 / steps_per_second
+        pixels_per_step = base_pps / steps_per_second
+        num_steps = max(2, int(dist / pixels_per_step))
+
+        dx = (target_x - cx) / num_steps
+        dy = (target_y - cy) / num_steps
+
+        for i in range(1, num_steps + 1):
+            interp_x = round(cx + dx * i)
+            interp_y = round(cy + dy * i)
+            # Use relative movement for backends that support it well
+            if self._backend.name == "pynput":
+                step_dx = round(dx)
+                step_dy = round(dy)
+                await self._pynput_move_mouse(step_dx, step_dy, relative=True)
+            else:
+                # ydotool / dotool: use absolute positioning per step
+                await self.move_mouse(interp_x, interp_y, relative=False)
+
+            await asyncio.sleep(step_interval)
+
+        # Final correction: ensure we land exactly on target
+        await self.move_mouse(target_x, target_y, relative=False)
+
+    async def _get_current_mouse_position(self) -> tuple[int, int]:
+        """Return the current (x, y) screen coordinates of the mouse cursor.
+
+        Uses the most reliable method available for the active backend.
+        """
+        if self._backend.name == "pynput":
+            from pynput.mouse import Controller as MouseController
+            mc = MouseController()
+            pos = await asyncio.to_thread(lambda: mc.position)
+            return int(pos[0]), int(pos[1])
+
+        # For ydotool / dotool backends try to read via pynput (reading
+        # usually works even on Wayland where injection doesn't).
+        try:
+            from pynput.mouse import Controller as MouseController
+            mc = MouseController()
+            pos = await asyncio.to_thread(lambda: mc.position)
+            return int(pos[0]), int(pos[1])
+        except Exception:
+            raise InputError("Cannot determine current mouse position.")
+
     # ------------------------------------------------------------------
     # click
     # ------------------------------------------------------------------

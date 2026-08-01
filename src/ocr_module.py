@@ -340,15 +340,23 @@ class OCRModule:
         self,
         image: "np.ndarray | Image.Image",
         region_config: "RegionConfig",
+        *,
+        override_bounds: tuple[int, int, int, int] | None = None,
+        override_name: str | None = None,
     ) -> OCRResult:
         """Run OCR on the region defined by *region_config*.
 
         Args:
             image: Full‑frame image (NumPy BGR/grayscale or PIL Image).
                 The region is cropped internally using
-                ``region_config.bounds``.
+                ``region_config.bounds`` unless *override_bounds* is given.
             region_config: A ``RegionConfig`` with bounds, preprocess
                 steps, and optional OCR overrides.
+            override_bounds: Optional ``(x1, y1, x2, y2)`` that replaces
+                ``region_config.bounds`` for this call.  Used by the
+                dynamic‑region locator to supply runtime‑resolved bounds.
+            override_name: Optional name suffix appended to
+                ``region_config.name`` for logging/cache isolation.
 
         Returns:
             ``OCRResult`` — always succeeds (failure → ``success=False``).
@@ -356,12 +364,15 @@ class OCRModule:
         import asyncio
 
         region_name = region_config.name
+        if override_name:
+            region_name = f"{region_name}#{override_name}"
         t_start = time_module.monotonic()
 
         try:
             # 1. Crop
             pil_img = self._to_pil(image)
-            cropped = self._crop_region(pil_img, region_config.bounds)
+            crop_bounds = override_bounds if override_bounds is not None else region_config.bounds
+            cropped = self._crop_region(pil_img, crop_bounds)
 
             # 2. Preprocess
             preprocessed, preprocess_hash = self._preprocess_image(cropped, region_config.preprocess)
@@ -412,8 +423,17 @@ class OCRModule:
                 )
 
             # 7. Retry with alternate preprocessing if confidence is low
+            #    Skip retries when confidence is literally 0.00 — no text was
+            #    found at all (blank region, no glyphs).  Retrying different
+            #    preprocessing won't help and just wastes time.
             retry_count = 0
             while confidence < self.config.confidence_threshold and retry_count < self.config.max_retries:
+                if confidence == 0.0:
+                    logger.debug(
+                        f"OCR confidence is 0.00 for '{region_name}' — "
+                        f"no text detected, skipping retries."
+                    )
+                    break
                 retry_count += 1
                 logger.debug(
                     f"OCR low confidence ({confidence:.2f} < {self.config.confidence_threshold}) "
@@ -575,14 +595,14 @@ class OCRModule:
 
     @staticmethod
     def _crop_region(pil_image: "Image.Image", bounds: tuple[int, int, int, int]) -> "Image.Image":
-        """Crop to (x1, y1, x2, y2)."""
+        """Crop to (x1, y1, x2, y2) with safe clamping to image edges."""
         x1, y1, x2, y2 = bounds
-        # Clamp to image dimensions
         w, h = pil_image.size
-        x1 = max(0, min(x1, w))
-        y1 = max(0, min(y1, h))
-        x2 = max(x1, min(x2, w))
-        y2 = max(y1, min(y2, h))
+        # Clamp to image dimensions (PIL uses half-open intervals, so x2≤w is valid)
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x2, w))
+        y2 = max(y1 + 1, min(y2, h))
 
         if x1 >= x2 or y1 >= y2:
             logger.debug(f"Invalid crop bounds after clamping: ({x1},{y1},{x2},{y2})")

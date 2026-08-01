@@ -1,5 +1,5 @@
 """
-Logging configuration for AI Game Master.
+Logging configuration for Ludomorph.
 
 Uses loguru for structured, coloured console output and rotating file logs.
 """

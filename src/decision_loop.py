@@ -71,9 +71,6 @@ _DEFAULT_FALLBACK_ACTION: str = "WAIT"
 _LARGE_DIFF_THRESHOLD: float = 50.0
 """Mean pixel diff above which a frame is considered high-priority."""
 
-_LOW_HEALTH_THRESHOLD: float = 20.0
-"""Health percentage below which frames are routed to the priority queue."""
-
 _MAX_LATENCY_SAMPLES: int = 30
 """Number of recent cycle‑latency values kept in the ring buffer."""
 
@@ -224,26 +221,48 @@ def _sync_vision_throttle_to_metrics(state_processor: Any, throttle: ThrottleSta
         pass
 
 
+def _safe_fallback_action(
+    profile_macros: list[dict[str, Any]],
+    last_action: str | None = None,
+) -> str:
+    """Return the safest action when the LLM is unreachable.
+
+    Game-agnostic: does **not** inspect game state fields (which are
+    profile‑specific).  Simply returns ``"WAIT"`` if available in the
+    profile, otherwise the last known action, or ``"WAIT"`` as final
+    fallback.
+
+    Args:
+        profile_macros: List of macro definitions from the active profile.
+        last_action: The previously chosen action, used as secondary
+            fallback when ``"WAIT"`` is not in the profile.
+
+    Returns:
+        A macro name that is guaranteed to exist in *profile_macros*
+        (or the literal string ``"WAIT"`` as ultimate default).
+    """
+    _names: set[str] = {m.get("name", "") for m in profile_macros if m.get("name")}
+
+    if "WAIT" in _names:
+        return "WAIT"
+    if last_action and last_action in _names:
+        return last_action
+    return _DEFAULT_FALLBACK_ACTION
+
+
 def check_high_priority_event(
     last_state: Any,
     diff_score: float | None,
 ) -> bool:
     """Heuristic for routing frames to the high‑priority queue.
 
-    Returns ``True`` when:
-    * ``last_state`` contains ``health`` below 20 %, **or**
-    * *diff_score* exceeds the large‑diff threshold (sudden scene change).
+    Returns ``True`` when *diff_score* exceeds the large‑diff threshold
+    (indicating a sudden scene change that warrants immediate processing).
 
-    This is called inside :func:`capture_producer` and is intentionally
-    cheap — it must not become a bottleneck.
+    This function is intentionally cheap — it must not become a bottleneck
+    inside :func:`capture_producer`.
     """
-    # Health check from last known state
-    if last_state is not None:
-        health = last_state.get("health") if hasattr(last_state, "get") else None
-        if health is not None and isinstance(health, (int, float)) and health < _LOW_HEALTH_THRESHOLD:
-            return True
-
-    # Large frame‑change check
+    # Large frame‑change check (game‑agnostic)
     if diff_score is not None and diff_score > _LARGE_DIFF_THRESHOLD:
         return True
 
@@ -363,13 +382,15 @@ async def decision_loop(
     capture_obj: Any,
     mcp: Any = None,
     summariser: Any = None,
+    health_monitor: Any = None,
 ) -> None:
     """Run the main perception → decision → action loop.
 
     This is the core of Phase 2.9.  It wires together every subsystem
     built in Phases 1–2 into a single continuous async pipeline.
 
-    The loop runs indefinitely until cancelled (e.g. by Ctrl + C).
+    The loop runs indefinitely until cancelled (e.g. by Ctrl + C) or
+    the game window is lost (Phase 6.4 health‑driven STOPPING).
 
     Args:
         state_processor: ``StateProcessor`` instance (Phase 2.4).
@@ -385,12 +406,27 @@ async def decision_loop(
             (memory tier disabled for this session).
         summariser: Optional ``MemorySummariser`` instance (Phase 3.4).
             If ``None``, automatic summarisation is disabled.
+        health_monitor: Optional ``HealthMonitor`` instance (Phase 6.4).
+            When provided, the loop queries health status each cycle
+            and applies graceful degradation: LLM‑down → rule‑based
+            fallback, OCR‑down → colour‑bars only, MCP‑down →
+            memory‑less mode, game‑window‑lost → clean stop.
     """
     _mcp_unavailable = mcp is None
     if _mcp_unavailable:
         logger.warning(
             "MCP client unavailable — memory tier disabled for this session."
         )
+
+    # --- HealthMonitor reference (Phase 6.4) ---
+    _hm = health_monitor
+
+    # --- Pre‑compute valid macro names for rule‑based fallback ---
+    _valid_macro_names: set[str] = {
+        m.get("name", "") for m in profile_macros if m.get("name")
+    }
+    if "WAIT" not in _valid_macro_names:
+        _valid_macro_names.add("WAIT")
 
     # --- Adaptive frame skipper (Phase 2.8) ---
     diff_config = _diff_config_from_global(config)
@@ -423,6 +459,11 @@ async def decision_loop(
     high_latency_count: int = 0
     frame_counter: int = 0
     latency_ring: list[float] = []  # ring buffer for cycle latencies
+    _last_health_check_time: float = 0.0
+    _cached_health_status: dict[str, Any] | None = None
+    _degraded_llm: bool = False
+    _degraded_ocr: bool = False
+    _degraded_mcp: bool = False
 
     cycle_start = time.monotonic()
 
@@ -469,12 +510,70 @@ async def decision_loop(
                 continue
 
             # ----------------------------------------------------------
-            # 3. Throttle‑driven OCR skip
+            # 0. Health check (Phase 6.4) — rate-limited to every 5 s
+            # ----------------------------------------------------------
+            if _hm is not None:
+                _now = time.monotonic()
+                if _now - _last_health_check_time >= 5.0:
+                    try:
+                        _health_status = await _hm.get_overall_status()
+                        _cached_health_status = _health_status
+                        _last_health_check_time = _now
+                    except Exception as _hexc:
+                        logger.warning(
+                            "Health check failed (%s) — reusing cached status.",
+                            _hexc,
+                        )
+                        if _cached_health_status is None:
+                            _cached_health_status = {
+                                "level": "OK",
+                                "reason": "Health check unavailable",
+                                "services": {},
+                            }
+
+                if _cached_health_status is not None:
+                    _level = _cached_health_status.get("level", "OK")
+                    _svc = _cached_health_status.get("services", {})
+
+                    # --- STOPPING: game window lost ---
+                    if _level == "STOPPING":
+                        logger.warning(
+                            "HealthMonitor reports STOPPING: %s — "
+                            "shutting down decision loop.",
+                            _cached_health_status.get("reason", "Game window lost"),
+                        )
+                        break  # exits the while True loop → triggers finally
+
+                    # --- DEGRADED flags ---
+                    _degraded_llm = not _svc.get("ollama", {}).get("healthy", True)
+                    _degraded_ocr = not _svc.get("tesseract", {}).get("healthy", True)
+                    _degraded_mcp = not _svc.get("mcp", {}).get("healthy", True)
+
+                    if _degraded_llm:
+                        logger.debug("LLM degraded — will use rule‑based fallback.")
+                    if _degraded_ocr:
+                        logger.debug("OCR degraded — forcing colour‑bars‑only mode.")
+                    if _degraded_mcp:
+                        logger.debug("MCP degraded — memory tier paused.")
+                else:
+                    _degraded_llm = False
+                    _degraded_ocr = False
+                    _degraded_mcp = False
+            else:
+                _degraded_llm = False
+                _degraded_ocr = False
+                _degraded_mcp = False
+
+            # ----------------------------------------------------------
+            # 3. Throttle‑driven OCR skip  (overridden by degradation)
             # ----------------------------------------------------------
             skip_ocr = (
-                throttle.active
-                and throttle.skip_ocr_alternate
-                and (frame_counter % 2 != 0)
+                _degraded_ocr
+                or (
+                    throttle.active
+                    and throttle.skip_ocr_alternate
+                    and (frame_counter % 2 != 0)
+                )
             )
 
             # ----------------------------------------------------------
@@ -483,7 +582,7 @@ async def decision_loop(
             try:
                 state = await asyncio.wait_for(
                     state_processor.process(frame, skip_ocr=skip_ocr),
-                    timeout=0.250,
+                    timeout=0.350,
                 )
             except asyncio.TimeoutError:
                 logger.debug(
@@ -508,8 +607,9 @@ async def decision_loop(
             else:
                 # ------------------------------------------------------
                 # 6. Query MCP memories  (Phase 3.3 — real)
+                #     Skipped when MCP is degraded or unavailable.
                 # ------------------------------------------------------
-                if not _mcp_unavailable:
+                if not _mcp_unavailable and not _degraded_mcp:
                     try:
                         memories = await mcp.search_memories(
                             query=build_memory_query(state),
@@ -527,51 +627,65 @@ async def decision_loop(
                     memories = []
 
                 # ------------------------------------------------------
-                # 7. Build LLM prompt
+                # 7. Decision — LLM or rule‑based fallback (Phase 6.4)
                 # ------------------------------------------------------
-                # Phase 4.4 — pass config and vision status so the
-                # prompt builder can inject spatial context and use the
-                # vision‑adjusted token budget.
-                context_reduction = (
-                    throttle.active and throttle.reduce_llm_context
-                )
-                max_tokens = 800 if not context_reduction else 400
-                # Determine if vision is active this cycle
-                _vision_wired_chk = (
-                    getattr(state_processor, "_vision", None) is not None
-                )
-                _vision_enabled_chk = (
-                    _vision_wired_chk
-                    and getattr(state_processor._vision, "is_enabled", False)
-                    if _vision_wired_chk
-                    else False
-                )
-
-                messages = build_llm_prompt(
-                    state=state,
-                    available_macros=profile_macros,
-                    memories=memories,
-                    max_tokens=max_tokens,
-                    config=config,
-                    vision_enabled=_vision_enabled_chk,
-                )
-
-                # ------------------------------------------------------
-                # 8. LLM decision  (≤ 200 ms timeout)
-                # ------------------------------------------------------
-                try:
-                    action = await call_llm_decision(
-                        messages=messages,
+                if _degraded_llm:
+                    # LLM unreachable → safe fallback (game‑agnostic)
+                    action = _safe_fallback_action(
                         profile_macros=profile_macros,
-                        config=config,
                         last_action=last_action,
-                        timeout=config.get("llm_timeout_ms", 200) / 1000.0,
                     )
-                except Exception as exc:
-                    logger.error(
-                        "LLM decision call raised: {}", exc
+                    logger.warning(
+                        "LLM degraded — safe fallback chose %r.",
+                        action,
                     )
-                    action = last_action or _DEFAULT_FALLBACK_ACTION
+                else:
+                    # --------------------------------------------------
+                    # 7a. Build LLM prompt
+                    # --------------------------------------------------
+                    # Phase 4.4 — pass config and vision status so the
+                    # prompt builder can inject spatial context and use
+                    # the vision‑adjusted token budget.
+                    context_reduction = (
+                        throttle.active and throttle.reduce_llm_context
+                    )
+                    max_tokens = 800 if not context_reduction else 400
+                    # Determine if vision is active this cycle
+                    _vision_wired_chk = (
+                        getattr(state_processor, "_vision", None) is not None
+                    )
+                    _vision_enabled_chk = (
+                        _vision_wired_chk
+                        and getattr(state_processor._vision, "is_enabled", False)
+                        if _vision_wired_chk
+                        else False
+                    )
+
+                    messages = build_llm_prompt(
+                        state=state,
+                        available_macros=profile_macros,
+                        memories=memories,
+                        max_tokens=max_tokens,
+                        config=config,
+                        vision_enabled=_vision_enabled_chk,
+                    )
+
+                    # --------------------------------------------------
+                    # 7b. LLM decision  (≤ 200 ms timeout)
+                    # --------------------------------------------------
+                    try:
+                        action = await call_llm_decision(
+                            messages=messages,
+                            profile_macros=profile_macros,
+                            config=config,
+                            last_action=last_action,
+                            timeout=config.get("llm_timeout_ms", 200) / 1000.0,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "LLM decision call raised: {}", exc
+                        )
+                        action = last_action or _DEFAULT_FALLBACK_ACTION
 
                 # Cache the result for future identical states
                 state_processor.cache_action(state, action)
@@ -590,9 +704,35 @@ async def decision_loop(
                     if hasattr(state, "get"):
                         detections = state.get("detections")
                     screen_w, screen_h = frame.shape[1], frame.shape[0]
+                    # --- Gather window offset and DPI scale for coordinate translation ---
+                    _window_offset: tuple[int, int] = (0, 0)
+                    _dpi_scale: float = 1.0
+                    if hasattr(capture_obj, "tracker") and capture_obj.tracker is not None:
+                        _win_rect = capture_obj.tracker.last_rect
+                        if _win_rect and len(_win_rect) >= 2:
+                            _window_offset = (int(_win_rect[0]), int(_win_rect[1]))
+                        _dpi_scale = getattr(capture_obj.tracker, "dpi_scale_factor", 1.0)
+
+                    # --- Resolve player_anchor from config for player‑relative targeting ---
+                    _player_anchor: tuple[int, int] | None = None
+                    _pa_raw = config.get("player_anchor")
+                    if isinstance(_pa_raw, (list, tuple)) and len(_pa_raw) >= 2:
+                        try:
+                            _player_anchor = (int(_pa_raw[0]), int(_pa_raw[1]))
+                        except (TypeError, ValueError):
+                            _player_anchor = None
+                    elif isinstance(_pa_raw, dict):
+                        try:
+                            _player_anchor = (int(_pa_raw["x"]), int(_pa_raw["y"]))
+                        except (KeyError, TypeError, ValueError):
+                            _player_anchor = None
+
                     resolver = MacroResolver(
                         detections=detections,
                         screen_size=(screen_w, screen_h),
+                        window_offset=_window_offset,
+                        dpi_scale_factor=_dpi_scale,
+                        player_anchor=_player_anchor,
                     )
                     resolved_steps = resolver.resolve_all(steps)
 
@@ -651,8 +791,9 @@ async def decision_loop(
 
             # ----------------------------------------------------------
             # 10. Store event  (fire‑and‑forget, Phase 3.3)
+            #     Skipped when MCP is degraded or unavailable (Phase 6.4).
             # ----------------------------------------------------------
-            if not _mcp_unavailable:
+            if not _mcp_unavailable and not _degraded_mcp:
 
                 async def _store_and_log() -> None:
                     try:
@@ -813,4 +954,5 @@ __all__ = [
     "find_macro_by_name",
     "build_memory_query",
     "check_high_priority_event",
+    "_safe_fallback_action",
 ]

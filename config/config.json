@@ -30,8 +30,11 @@
   "state_cache_ttl_seconds": 0.3,
   "ocr_cache_ttl_seconds": 2.0,
   "auto_focus_window": true,
+  "window_title": null,
+  "capture_region": null,
   "log_level": "INFO",
   "input_backend": "auto",
+  "mouse_speed": 1.0,
   "vision": {
     "enabled": false,
     "model_path": "models/yolo11n.onnx",

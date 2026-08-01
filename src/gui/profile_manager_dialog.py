@@ -5,7 +5,7 @@ Provides a modal Toplevel dialog with two modes:
 - **Import**: Select a .gameai_profile file, view validation results, and import.
 - **Export**: Fill in profile metadata, choose optional inclusions, and export.
 
-Matches the dark theme palette from main_window.py.
+Uses the centralised theme system from `src.gui.theme`.
 """
 
 from __future__ import annotations
@@ -18,21 +18,7 @@ from typing import Any
 import tkinter as tk
 from tkinter import ttk
 
-# ---------------------------------------------------------------------------
-# Colour palette (matches main_window.py dark theme)
-# ---------------------------------------------------------------------------
-
-_BG = "#1E1E1E"
-_FG = "#D4D4D4"
-_ACCENT = "#0078D4"
-_SUCCESS = "#50C878"
-_DANGER = "#E04040"
-_WARNING = "#E8A317"
-_DISABLED_BG = "#3C3C3C"
-_DISABLED_FG = "#808080"
-_FRAME_BG = "#252526"
-_ENTRY_BG = "#2D2D2D"
-_ENTRY_FG = "#D4D4D4"
+from src.gui.theme import ThemeManager, resolve_font_stack
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +54,13 @@ class ProfileManagerDialog(tk.Toplevel):
         self._profile_name = profile_name
         self._on_imported = on_imported
 
-        self.configure(bg=_BG)
+        self._tm = ThemeManager()
+        self._tm.apply_ttk_styles()
+        self._p = self._tm.palette
+        self._ui_font = resolve_font_stack(self._p.ui_font)
+        self._mono_font = resolve_font_stack(self._p.mono_font)
+
+        self.configure(bg=self._p.bg)
         if mode == "import":
             self.title("Import Profile")
         else:
@@ -103,31 +95,32 @@ class ProfileManagerDialog(tk.Toplevel):
 
     def _build_import_ui(self) -> None:
         """Build the import‑mode dialog."""
-        main = tk.Frame(self, bg=_BG, padx=16, pady=12)
+        p = self._p
+        main = tk.Frame(self, bg=p.bg, padx=16, pady=12)
         main.pack(fill=tk.BOTH, expand=True)
 
         # Title
         tk.Label(
             main,
             text="Import a .gameai_profile Archive",
-            bg=_BG,
-            fg=_FG,
-            font=("Segoe UI", 12, "bold"),
+            bg=p.bg,
+            fg=p.fg,
+            font=(self._ui_font, 12, "bold"),
         ).pack(anchor=tk.W, pady=(0, 12))
 
         # File picker row
-        file_row = tk.Frame(main, bg=_BG)
+        file_row = tk.Frame(main, bg=p.bg)
         file_row.pack(fill=tk.X, pady=(0, 8))
 
         self._zip_path_var = tk.StringVar()
         tk.Entry(
             file_row,
             textvariable=self._zip_path_var,
-            bg=_ENTRY_BG,
-            fg=_ENTRY_FG,
-            insertbackground=_ENTRY_FG,
+            bg=p.entry_bg,
+            fg=p.entry_fg,
+            insertbackground=p.entry_insert,
             relief=tk.FLAT,
-            font=("Segoe UI", 10),
+            font=(self._ui_font, 10),
             width=42,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
@@ -138,7 +131,7 @@ class ProfileManagerDialog(tk.Toplevel):
         ).pack(side=tk.LEFT)
 
         # Validate button
-        btn_row = tk.Frame(main, bg=_BG)
+        btn_row = tk.Frame(main, bg=p.bg)
         btn_row.pack(fill=tk.X, pady=(0, 8))
 
         self._btn_validate = ttk.Button(
@@ -155,9 +148,9 @@ class ProfileManagerDialog(tk.Toplevel):
         results_frame = tk.LabelFrame(
             main,
             text="Validation Results",
-            bg=_BG,
-            fg=_FG,
-            font=("Segoe UI", 9, "bold"),
+            bg=p.bg,
+            fg=p.fg,
+            font=(self._ui_font, 9, "bold"),
             padx=8,
             pady=6,
         )
@@ -165,10 +158,10 @@ class ProfileManagerDialog(tk.Toplevel):
 
         self._results_text = tk.Text(
             results_frame,
-            bg=_ENTRY_BG,
-            fg=_FG,
-            insertbackground=_FG,
-            font=("Consolas", 9),
+            bg=p.entry_bg,
+            fg=p.fg,
+            insertbackground=p.fg,
+            font=(self._mono_font, 9),
             height=12,
             width=60,
             state=tk.DISABLED,
@@ -212,6 +205,7 @@ class ProfileManagerDialog(tk.Toplevel):
 
         from src.profile_manager import validate_profile_zip
 
+        p = self._p
         result = validate_profile_zip(zip_path)
 
         # Clear and show results
@@ -245,10 +239,10 @@ class ProfileManagerDialog(tk.Toplevel):
         self._results_text.configure(state=tk.DISABLED)
 
         # Tag configuration for coloured output
-        self._results_text.tag_configure("success", foreground=_SUCCESS)
-        self._results_text.tag_configure("error", foreground=_DANGER)
-        self._results_text.tag_configure("warning", foreground=_WARNING)
-        self._results_text.tag_configure("header", foreground=_ACCENT)
+        self._results_text.tag_configure("success", foreground=p.success)
+        self._results_text.tag_configure("error", foreground=p.danger)
+        self._results_text.tag_configure("warning", foreground=p.warning)
+        self._results_text.tag_configure("header", foreground=p.accent)
 
     def _on_import(self) -> None:
         """Run the import and notify the caller."""
@@ -279,16 +273,17 @@ class ProfileManagerDialog(tk.Toplevel):
 
     def _build_export_ui(self) -> None:
         """Build the export‑mode dialog."""
-        main = tk.Frame(self, bg=_BG, padx=16, pady=12)
+        p = self._p
+        main = tk.Frame(self, bg=p.bg, padx=16, pady=12)
         main.pack(fill=tk.BOTH, expand=True)
 
         # Title
         tk.Label(
             main,
             text="Export Profile as .gameai_profile",
-            bg=_BG,
-            fg=_FG,
-            font=("Segoe UI", 12, "bold"),
+            bg=p.bg,
+            fg=p.fg,
+            font=(self._ui_font, 12, "bold"),
         ).pack(anchor=tk.W, pady=(0, 12))
 
         # Form fields
@@ -303,15 +298,15 @@ class ProfileManagerDialog(tk.Toplevel):
         self._field_vars: dict[str, tk.StringVar] = {}
 
         for label_text, key, default in fields:
-            row = tk.Frame(main, bg=_BG)
+            row = tk.Frame(main, bg=p.bg)
             row.pack(fill=tk.X, pady=2)
 
             tk.Label(
                 row,
                 text=label_text,
-                bg=_BG,
-                fg=_FG,
-                font=("Segoe UI", 10),
+                bg=p.bg,
+                fg=p.fg,
+                font=(self._ui_font, 10),
                 width=16,
                 anchor=tk.W,
             ).pack(side=tk.LEFT)
@@ -321,23 +316,23 @@ class ProfileManagerDialog(tk.Toplevel):
             tk.Entry(
                 row,
                 textvariable=var,
-                bg=_ENTRY_BG,
-                fg=_ENTRY_FG,
-                insertbackground=_ENTRY_FG,
+                bg=p.entry_bg,
+                fg=p.entry_fg,
+                insertbackground=p.entry_insert,
                 relief=tk.FLAT,
-                font=("Segoe UI", 10),
+                font=(self._ui_font, 10),
                 width=30,
             ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # Tags
-        tags_row = tk.Frame(main, bg=_BG)
+        tags_row = tk.Frame(main, bg=p.bg)
         tags_row.pack(fill=tk.X, pady=2)
         tk.Label(
             tags_row,
             text="Tags (comma-sep.)",
-            bg=_BG,
-            fg=_FG,
-            font=("Segoe UI", 10),
+            bg=p.bg,
+            fg=p.fg,
+            font=(self._ui_font, 10),
             width=16,
             anchor=tk.W,
         ).pack(side=tk.LEFT)
@@ -345,11 +340,11 @@ class ProfileManagerDialog(tk.Toplevel):
         tk.Entry(
             tags_row,
             textvariable=self._tags_var,
-            bg=_ENTRY_BG,
-            fg=_ENTRY_FG,
-            insertbackground=_ENTRY_FG,
+            bg=p.entry_bg,
+            fg=p.entry_fg,
+            insertbackground=p.entry_insert,
             relief=tk.FLAT,
-            font=("Segoe UI", 10),
+            font=(self._ui_font, 10),
             width=30,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
@@ -357,9 +352,9 @@ class ProfileManagerDialog(tk.Toplevel):
         opt_frame = tk.LabelFrame(
             main,
             text="Optional Inclusions",
-            bg=_BG,
-            fg=_FG,
-            font=("Segoe UI", 9, "bold"),
+            bg=p.bg,
+            fg=p.fg,
+            font=(self._ui_font, 9, "bold"),
             padx=10,
             pady=6,
         )
@@ -380,24 +375,24 @@ class ProfileManagerDialog(tk.Toplevel):
                 opt_frame,
                 text=text,
                 variable=var,
-                bg=_BG,
-                fg=_FG,
-                selectcolor=_BG,
-                activebackground=_BG,
-                activeforeground=_FG,
-                font=("Segoe UI", 9),
+                bg=p.bg,
+                fg=p.fg,
+                selectcolor=p.bg,
+                activebackground=p.bg,
+                activeforeground=p.fg,
+                font=(self._ui_font, 9),
             )
             cb.pack(anchor=tk.W)
 
         # Output file
-        out_row = tk.Frame(main, bg=_BG)
+        out_row = tk.Frame(main, bg=p.bg)
         out_row.pack(fill=tk.X, pady=(8, 4))
         tk.Label(
             out_row,
             text="Output File",
-            bg=_BG,
-            fg=_FG,
-            font=("Segoe UI", 10),
+            bg=p.bg,
+            fg=p.fg,
+            font=(self._ui_font, 10),
             width=16,
             anchor=tk.W,
         ).pack(side=tk.LEFT)
@@ -406,11 +401,11 @@ class ProfileManagerDialog(tk.Toplevel):
         tk.Entry(
             out_row,
             textvariable=self._output_var,
-            bg=_ENTRY_BG,
-            fg=_ENTRY_FG,
-            insertbackground=_ENTRY_FG,
+            bg=p.entry_bg,
+            fg=p.entry_fg,
+            insertbackground=p.entry_insert,
             relief=tk.FLAT,
-            font=("Segoe UI", 10),
+            font=(self._ui_font, 10),
             width=30,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
@@ -419,7 +414,7 @@ class ProfileManagerDialog(tk.Toplevel):
         )
 
         # Action buttons
-        btn_row = tk.Frame(main, bg=_BG)
+        btn_row = tk.Frame(main, bg=p.bg)
         btn_row.pack(fill=tk.X, pady=(10, 0))
 
         ttk.Button(btn_row, text="📤  Export", command=self._on_export).pack(

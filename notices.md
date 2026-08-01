@@ -1,4 +1,4 @@
-Game AI Agent
+Ludomorph
 Copyright (c) 2026 [Sarah Schmidt] (@[SAI-DAEMON])
 
 Contact: @[SAI-DAEMON] on GitHub
@@ -31,8 +31,7 @@ Third-Party Licenses
    Source: https://github.com/madmaze/pytesseract
 
 5. opencv-python
-   Wrapper: MIT License
-   OpenCV core: BSD-3-Clause License
+   License MIT and Apache-2.0
    Source: https://github.com/opencv/opencv-python
 
 6. httpx
@@ -66,15 +65,20 @@ Third-Party Licenses
     Source: https://github.com/ultralytics/ultralytics
     Note: For commercial use, an Enterprise License is required.
 
-12. MCP Memory Server
-    Copyright (c) doobidoo / insidedeveloper888
+12. MCP Memory Server (MCP Memory Service Subroutine)
+    Copyright (c) doobidoo / insidedeveloper888 / SAI-DAEMON
     License: Apache-2.0
-    Source: https://github.com/insidedeveloper888/mcp-memory-service
+    Source: https://github.com/Sai-daemon/mcp-memory-service-subroutine
 
 13. python-ydotool
-    License: [To be confirmed — see note below]
+    License: AGPL-3
     Source: https://pypi.org/project/python-ydotool/
-    Note: License not explicitly declared. Contact maintainer for clarification.
+   
+
+14. Pillow (PIL)
+    Copyright (c) 2010-2025 Alex Clark and contributors
+    License: MIT-CMU
+    Source: https://github.com/python-pillow/Pillow
 
 ========================================================================
 Full license texts are available in the LICENSES/ directory.

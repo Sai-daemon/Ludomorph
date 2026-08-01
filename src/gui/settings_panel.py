@@ -7,6 +7,7 @@ Provides a modal Toplevel dialog with tabbed settings for:
 - Performance (frame skip, cache TTLs)
 - Vision (enable, model, thresholds, backend)
 - Input (backend selection)
+- Theme / UI (theme mode, custom background colour) ← NEW
 
 Reads from config.json via ConfigManager, validates user input, and
 atomically writes changes back to disk.
@@ -22,23 +23,7 @@ from typing import Any
 import tkinter as tk
 from tkinter import ttk
 
-# ---------------------------------------------------------------------------
-# Colour palette (matches main_window.py dark theme)
-# ---------------------------------------------------------------------------
-
-_BG = "#1E1E1E"
-_FG = "#D4D4D4"
-_ACCENT = "#0078D4"
-_SUCCESS = "#50C878"
-_DANGER = "#E04040"
-_WARNING = "#E8A317"
-_DISABLED_BG = "#3C3C3C"
-_DISABLED_FG = "#808080"
-_FRAME_BG = "#252526"
-_LABEL_BG = "#1E1E1E"
-_ENTRY_BG = "#2D2D2D"
-_ENTRY_FG = "#D4D4D4"
-_ENTRY_INSERT = "#D4D4D4"
+from src.gui.theme import ThemeManager, resolve_font_stack
 
 # ---------------------------------------------------------------------------
 # Helpers for nested dict access (e.g., "vision.enabled" → config["vision"]["enabled"])
@@ -94,8 +79,15 @@ class SettingsPanel(tk.Toplevel):
     def __init__(self, parent: tk.Widget) -> None:
         super().__init__(parent)
 
+        # -- Theme ------------------------------------------------------------
+        self._tm = ThemeManager()
+        self._tm.apply_ttk_styles()
+        p = self._tm.palette
+        self._ui_font = resolve_font_stack(p.ui_font)
+        self._mono_font = resolve_font_stack(p.mono_font)
+
         self.title("Settings")
-        self.configure(bg=_BG)
+        self.configure(bg=p.bg)
         self.geometry("700x520")
         self.minsize(600, 400)
 
@@ -123,26 +115,34 @@ class SettingsPanel(tk.Toplevel):
         self._logger.info("Settings Panel opened.")
 
     # ------------------------------------------------------------------
+    # Colour helpers (delegate to theme)
+    # ------------------------------------------------------------------
+
+    @property
+    def _p(self):
+        """Shortcut to the active palette."""
+        return self._tm.palette
+
+    # ------------------------------------------------------------------
     # Config loading
     # ------------------------------------------------------------------
 
     def _load_config(self) -> dict[str, Any]:
-        """Load global config via ConfigManager, or from disk if not available."""
+        """Load global config via ConfigManager.
+
+        Falls back to DEFAULT_CONFIG (built-in defaults) only when
+        ConfigManager itself fails — never to the *bundled* config file,
+        which is a static snapshot and not the user's live config.
+        """
         try:
             from src.config_manager import load_global_config
 
             return load_global_config()
-        except Exception:
-            # Fallback: load directly from the config dir
-            config_path = Path(__file__).resolve().parent.parent.parent / "config" / "config.json"
-            if config_path.exists():
-                import json
-
-                try:
-                    return json.loads(config_path.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, FileNotFoundError):
-                    pass
-            # Ultimate fallback: built‑in defaults
+        except Exception as exc:
+            self._logger.warning(
+                "Could not load config via ConfigManager: %s — using built-in defaults.",
+                exc,
+            )
             from src.config_manager import DEFAULT_CONFIG
 
             return dict(DEFAULT_CONFIG)
@@ -159,36 +159,42 @@ class SettingsPanel(tk.Toplevel):
 
     def _build_toolbar(self) -> None:
         """Title bar label — just shows 'Settings'."""
-        header = tk.Frame(self, bg=_BG, padx=12, pady=8)
+        p = self._p
+        header = tk.Frame(self, bg=p.bg, padx=12, pady=8)
         header.pack(fill=tk.X, side=tk.TOP)
 
         tk.Label(
             header,
             text="⚙  Settings",
-            bg=_BG,
-            fg=_FG,
-            font=("Segoe UI", 14, "bold"),
+            bg=p.bg,
+            fg=p.fg,
+            font=(self._ui_font, 14, "bold"),
         ).pack(side=tk.LEFT)
 
         tk.Label(
             header,
             text="config.json",
-            bg=_BG,
-            fg=_DISABLED_FG,
-            font=("Segoe UI", 9),
+            bg=p.bg,
+            fg=p.disabled_fg,
+            font=(self._ui_font, 9),
         ).pack(side=tk.RIGHT, padx=8)
 
     def _build_notebook(self) -> None:
-        """Create the tabbed notebook and populate each tab."""
+        """Create the tabbed notebook and populate each tab.
+
+        Also initialises the widget tracking lists used by _collect_changes.
+        """
+        self._tracked_entries: list[tk.Entry] = []
+        self._tracked_combos: list[ttk.Combobox] = []
+        self._tracked_checkboxes: list[tk.Checkbutton] = []
+        self._tracked_spinboxes: list[ttk.Spinbox] = []
+        self._tracked_sliders: list[tk.Scale] = []
+
+        p = self._p
         self._notebook = ttk.Notebook(self)
         self._notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
 
-        # Style the notebook for dark theme
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TNotebook", background=_BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=_DISABLED_BG, foreground=_FG, padding=(12, 4), font=("Segoe UI", 10))
-        style.map("TNotebook.Tab", background=[("selected", _ACCENT)], foreground=[("selected", "#FFFFFF")])
+        # Notebook styling is already handled by ThemeManager.apply_ttk_styles()
 
         # Create each tab
         self._build_general_tab()
@@ -196,47 +202,27 @@ class SettingsPanel(tk.Toplevel):
         self._build_performance_tab()
         self._build_vision_tab()
         self._build_input_tab()
+        self._build_theme_tab()  # ← NEW
 
     def _build_status_bar(self) -> None:
         """Bottom bar with action buttons and status text."""
-        bottom = tk.Frame(self, bg="#2D2D2D", padx=8, pady=6)
+        p = self._p
+        bottom = tk.Frame(self, bg=p.status_bar_bg, padx=8, pady=6)
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
 
-        # Style for bottom buttons
-        style = ttk.Style()
-        style.configure(
-            "Settings.TButton",
-            background=_ACCENT,
-            foreground="#FFFFFF",
-            font=("Segoe UI", 9, "bold"),
-            borderwidth=1,
-            padding=(12, 3),
-        )
-        style.map("Settings.TButton", background=[("active", "#005A9E")])
-        style.configure(
-            "SettingsDanger.TButton",
-            background=_DANGER,
-            foreground="#FFFFFF",
-            font=("Segoe UI", 9, "bold"),
-            borderwidth=1,
-            padding=(12, 3),
-        )
-        style.map("SettingsDanger.TButton", background=[("active", "#C03030")])
-
-        ttk.Button(bottom, text="💾  Save", style="Settings.TButton", command=self._on_save).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bottom, text="↻  Reset to Defaults", style="Settings.TButton", command=self._on_reset_defaults).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Button(bottom, text="✖  Cancel", style="SettingsDanger.TButton", command=self._on_cancel).pack(
-            side=tk.RIGHT, padx=2
-        )
+        ttk.Button(bottom, text="💾  Save", style="Settings.TButton",
+                   command=self._on_save).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bottom, text="↻  Reset to Defaults", style="Settings.TButton",
+                   command=self._on_reset_defaults).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bottom, text="✖  Cancel", style="SettingsDanger.TButton",
+                   command=self._on_cancel).pack(side=tk.RIGHT, padx=2)
 
         self._lbl_status = tk.Label(
             bottom,
             text="",
-            bg="#2D2D2D",
-            fg=_DISABLED_FG,
-            font=("Segoe UI", 9),
+            bg=p.status_bar_bg,
+            fg=p.disabled_fg,
+            font=(self._ui_font, 9),
             padx=10,
         )
         self._lbl_status.pack(side=tk.RIGHT)
@@ -250,13 +236,14 @@ class SettingsPanel(tk.Toplevel):
 
         Returns the inner content frame (the one to pack widgets into).
         """
-        outer = tk.Frame(notebook, bg=_BG)
+        p = self._p
+        outer = tk.Frame(notebook, bg=p.bg)
         notebook.add(outer, text=title)
 
         # Canvas + scrollbar for scrollable content
-        canvas = tk.Canvas(outer, bg=_BG, highlightthickness=0)
+        canvas = tk.Canvas(outer, bg=p.bg, highlightthickness=0)
         scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
-        inner = tk.Frame(canvas, bg=_BG)
+        inner = tk.Frame(canvas, bg=p.bg)
 
         inner.bind(
             "<Configure>",
@@ -299,11 +286,12 @@ class SettingsPanel(tk.Toplevel):
     @staticmethod
     def _add_section_label(parent: tk.Widget, text: str) -> tk.Label:
         """Add a bold section header."""
+        p = ThemeManager().palette
         lbl = tk.Label(
             parent,
             text=text,
-            bg=_BG,
-            fg=_FG,
+            bg=p.bg,
+            fg=p.fg,
             font=("Segoe UI", 11, "bold"),
             anchor=tk.W,
         )
@@ -312,10 +300,12 @@ class SettingsPanel(tk.Toplevel):
 
     def _add_entry_row(self, parent: tk.Widget, label: str, key_path: str, width: int = 40) -> tk.Entry:
         """Add a labelled Entry row. Returns the Entry widget."""
-        row = tk.Frame(parent, bg=_BG)
+        p = self._p
+        row = tk.Frame(parent, bg=p.bg)
         row.pack(fill=tk.X, padx=12, pady=2)
 
-        tk.Label(row, text=label, bg=_BG, fg=_FG, font=("Segoe UI", 10), width=24, anchor=tk.W).pack(
+        tk.Label(row, text=label, bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 10), width=24, anchor=tk.W).pack(
             side=tk.LEFT, padx=(0, 4)
         )
 
@@ -323,15 +313,15 @@ class SettingsPanel(tk.Toplevel):
         entry = tk.Entry(
             row,
             textvariable=var,
-            bg=_ENTRY_BG,
-            fg=_ENTRY_FG,
-            insertbackground=_ENTRY_INSERT,
-            font=("Consolas", 10),
+            bg=p.entry_bg,
+            fg=p.entry_fg,
+            insertbackground=p.entry_insert,
+            font=(self._mono_font, 10),
             width=width,
             relief=tk.FLAT,
             highlightthickness=1,
-            highlightbackground=_DISABLED_BG,
-            highlightcolor=_ACCENT,
+            highlightbackground=p.disabled_bg,
+            highlightcolor=p.accent,
         )
         entry.pack(side=tk.LEFT)
 
@@ -346,10 +336,12 @@ class SettingsPanel(tk.Toplevel):
         self, parent: tk.Widget, label: str, key_path: str, values: list[str], width: int = 20
     ) -> ttk.Combobox:
         """Add a labelled Combobox row. Returns the Combobox."""
-        row = tk.Frame(parent, bg=_BG)
+        p = self._p
+        row = tk.Frame(parent, bg=p.bg)
         row.pack(fill=tk.X, padx=12, pady=2)
 
-        tk.Label(row, text=label, bg=_BG, fg=_FG, font=("Segoe UI", 10), width=24, anchor=tk.W).pack(
+        tk.Label(row, text=label, bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 10), width=24, anchor=tk.W).pack(
             side=tk.LEFT, padx=(0, 4)
         )
 
@@ -366,7 +358,8 @@ class SettingsPanel(tk.Toplevel):
 
     def _add_checkbox_row(self, parent: tk.Widget, label: str, key_path: str) -> tk.Checkbutton:
         """Add a labelled Checkbox row. Returns the Checkbutton."""
-        row = tk.Frame(parent, bg=_BG)
+        p = self._p
+        row = tk.Frame(parent, bg=p.bg)
         row.pack(fill=tk.X, padx=12, pady=2)
 
         current = _get_nested(self._modified_config, key_path)
@@ -375,12 +368,12 @@ class SettingsPanel(tk.Toplevel):
             row,
             text=label,
             variable=var,
-            bg=_BG,
-            fg=_FG,
-            selectcolor=_BG,
-            activebackground=_BG,
-            activeforeground=_FG,
-            font=("Segoe UI", 10),
+            bg=p.bg,
+            fg=p.fg,
+            selectcolor=p.bg,
+            activebackground=p.bg,
+            activeforeground=p.fg,
+            font=(self._ui_font, 10),
             anchor=tk.W,
         )
         cb.pack(side=tk.LEFT)
@@ -402,10 +395,12 @@ class SettingsPanel(tk.Toplevel):
         width: int = 10,
     ) -> ttk.Spinbox:
         """Add a labelled Spinbox row. Returns the Spinbox."""
-        row = tk.Frame(parent, bg=_BG)
+        p = self._p
+        row = tk.Frame(parent, bg=p.bg)
         row.pack(fill=tk.X, padx=12, pady=2)
 
-        tk.Label(row, text=label, bg=_BG, fg=_FG, font=("Segoe UI", 10), width=24, anchor=tk.W).pack(
+        tk.Label(row, text=label, bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 10), width=24, anchor=tk.W).pack(
             side=tk.LEFT, padx=(0, 4)
         )
 
@@ -432,10 +427,12 @@ class SettingsPanel(tk.Toplevel):
         resolution: float = 0.05,
     ) -> tuple[tk.Scale, tk.Label]:
         """Add a labelled Scale (slider) row with a value readout. Returns (scale, value_label)."""
-        row = tk.Frame(parent, bg=_BG)
+        p = self._p
+        row = tk.Frame(parent, bg=p.bg)
         row.pack(fill=tk.X, padx=12, pady=2)
 
-        tk.Label(row, text=label, bg=_BG, fg=_FG, font=("Segoe UI", 10), width=24, anchor=tk.W).pack(
+        tk.Label(row, text=label, bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 10), width=24, anchor=tk.W).pack(
             side=tk.LEFT, padx=(0, 4)
         )
 
@@ -449,17 +446,18 @@ class SettingsPanel(tk.Toplevel):
             to=to,
             resolution=resolution,
             orient=tk.HORIZONTAL,
-            bg=_BG,
-            fg=_FG,
-            highlightbackground=_BG,
-            troughcolor=_DISABLED_BG,
-            activebackground=_ACCENT,
+            bg=p.bg,
+            fg=p.fg,
+            highlightbackground=p.bg,
+            troughcolor=p.disabled_bg,
+            activebackground=p.accent,
             length=200,
         )
         scale.pack(side=tk.LEFT)
 
         val_lbl = tk.Label(
-            row, text=f"{current:.2f}", bg=_BG, fg=_ACCENT, font=("Consolas", 10), width=5
+            row, text=f"{current:.2f}", bg=p.bg, fg=p.accent,
+            font=(self._mono_font, 10), width=5
         )
         val_lbl.pack(side=tk.LEFT, padx=6)
 
@@ -495,9 +493,7 @@ class SettingsPanel(tk.Toplevel):
         # --- General ---
         self._add_section_label(inner, "General")
         self._add_combo_row(
-            inner,
-            "Log Level:",
-            "log_level",
+            inner, "Log Level:", "log_level",
             ["DEBUG", "INFO", "WARNING", "ERROR"],
         )
         self._add_checkbox_row(inner, "Auto‑focus game window", "auto_focus_window")
@@ -550,86 +546,257 @@ class SettingsPanel(tk.Toplevel):
 
         self._add_section_label(inner, "Backend")
         self._add_combo_row(
-            inner,
-            "Inference Backend:",
-            "vision.backend",
-            ["auto", "cpu", "openvino", "cuda"],
-            width=12,
+            inner, "Inference Backend:", "vision.backend",
+            ["auto", "cpu", "openvino", "cuda"], width=12,
         )
 
     def _build_input_tab(self) -> None:
-        """Build the Input tab: backend selection."""
+        """Build the Input tab: backend selection and mouse smoothing."""
+        p = self._p
         inner = self._create_tab_frame(self._notebook, "Input")
 
+        # === Input Injection Backend =====================================
         self._add_section_label(inner, "Input Injection Backend")
         self._add_combo_row(
-            inner,
-            "Input Backend:",
-            "input_backend",
-            ["auto", "pynput", "ydotool", "dotool"],
-            width=12,
+            inner, "Input Backend:", "input_backend",
+            ["auto", "pynput", "ydotool", "dotool"], width=12,
         )
 
-        # Help text
-        help_frame = tk.Frame(inner, bg=_BG)
-        help_frame.pack(fill=tk.X, padx=12, pady=(16, 8))
-
-        help_text = (
-            "auto → detects platform automatically\n"
-            "pynput → recommended for Windows & X11\n"
-            "ydotool → required for Linux Wayland\n"
-            "dotool → fallback if ydotoold is unavailable"
-        )
+        # Backend help text
+        backend_help = tk.Frame(inner, bg=p.bg)
+        backend_help.pack(fill=tk.X, padx=12, pady=(0, 12))
         tk.Label(
-            help_frame,
-            text=help_text,
-            bg=_BG,
-            fg=_DISABLED_FG,
-            font=("Segoe UI", 9),
+            backend_help,
+            text=(
+                "auto   → detects platform automatically\n"
+                "pynput → recommended for Windows & X11\n"
+                "ydotool → required for Linux Wayland\n"
+                "dotool → fallback if ydotoold is unavailable"
+            ),
+            bg=p.bg,
+            fg=p.disabled_fg,
+            font=(self._ui_font, 9),
             justify=tk.LEFT,
         ).pack(anchor=tk.W)
 
-    # ------------------------------------------------------------------
-    # Initialisation – track all widget references for save
-    # ------------------------------------------------------------------
-
-    def _build_notebook(self) -> None:
-        """Create the tabbed notebook and populate each tab.
-
-        Also initialises the widget tracking lists used by _collect_changes.
-        """
-        self._tracked_entries: list[tk.Entry] = []
-        self._tracked_combos: list[ttk.Combobox] = []
-        self._tracked_checkboxes: list[tk.Checkbutton] = []
-        self._tracked_spinboxes: list[ttk.Spinbox] = []
-        self._tracked_sliders: list[tk.Scale] = []
-
-        self._notebook = ttk.Notebook(self)
-        self._notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
-
-        # Style the notebook for dark theme
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TNotebook", background=_BG, borderwidth=0)
-        style.configure(
-            "TNotebook.Tab",
-            background=_DISABLED_BG,
-            foreground=_FG,
-            padding=(12, 4),
-            font=("Segoe UI", 10),
-        )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", _ACCENT)],
-            foreground=[("selected", "#FFFFFF")],
+        # === Mouse Smoothing ==============================================
+        self._add_section_label(inner, "Mouse Smoothing")
+        self._add_slider_row(
+            inner, "Mouse Speed:", "mouse_speed",
+            from_=0.0, to=2.0, resolution=0.1,
         )
 
-        # Create each tab
-        self._build_general_tab()
-        self._build_llm_tab()
-        self._build_performance_tab()
-        self._build_vision_tab()
-        self._build_input_tab()
+        # Snap-point labels — aligned directly below the 200px slider
+        # Layout: [24-char label] [slider 200px] [value label]
+        # We use a frame with the same offset + width as the slider row
+        snap_frame = tk.Frame(inner, bg=p.bg)
+        snap_frame.pack(fill=tk.X, padx=12, pady=(0, 4))
+
+        # Matching the label width from _add_slider_row (width=24)
+        tk.Label(snap_frame, text="", bg=p.bg, width=24).pack(side=tk.LEFT, padx=(0, 4))
+
+        # Bar container matching slider length=200
+        bar_frame = tk.Frame(snap_frame, bg=p.bg, width=200, height=28)
+        bar_frame.pack(side=tk.LEFT)
+        bar_frame.pack_propagate(False)
+
+        # Slow — left edge
+        tk.Label(
+            bar_frame, text="Slow\n· Human-like", bg=p.bg,
+            fg=p.disabled_fg, font=(self._ui_font, 7),
+            justify=tk.LEFT,
+        ).pack(side=tk.LEFT)
+
+        # Spacer in the middle
+        tk.Frame(bar_frame, bg=p.bg).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Normal — roughly centered
+        tk.Label(
+            bar_frame, text="Normal\n· Smooth", bg=p.bg,
+            fg=p.disabled_fg, font=(self._ui_font, 7),
+            justify=tk.CENTER,
+        ).pack(side=tk.LEFT, padx=4)
+
+        # Another spacer
+        tk.Frame(bar_frame, bg=p.bg).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Fast — right edge
+        tk.Label(
+            bar_frame, text="Fast\n· Instant", bg=p.bg,
+            fg=p.disabled_fg, font=(self._ui_font, 7),
+            justify=tk.RIGHT,
+        ).pack(side=tk.RIGHT)
+
+        # Speed description — aligned under the slider via a label-width spacer
+        speed_help = tk.Frame(inner, bg=p.bg)
+        speed_help.pack(fill=tk.X, padx=12, pady=(8, 8))
+        
+        # Spacer matching the 24-char label + 4px gap from _add_slider_row
+        tk.Label(speed_help, text="", bg=p.bg, width=24).pack(side=tk.LEFT, padx=(0, 4))
+        
+        tk.Label(
+            speed_help,
+            text=(
+                "0.0 (Slow)   → ~600 px/s  — human-like deliberate glide\n"
+                "1.0 (Normal) → ~3000 px/s — smooth, faster than human\n"
+                "2.0 (Fast)    → instant teleport, no interpolation"
+            ),
+            bg=p.bg,
+            fg=p.disabled_fg,
+            font=(self._ui_font, 9),
+            justify=tk.LEFT,
+        ).pack(side=tk.LEFT)
+
+    # ------------------------------------------------------------------
+    # NEW: Theme / UI tab
+    # ------------------------------------------------------------------
+
+    def _build_theme_tab(self) -> None:
+        """Build the Theme / UI tab: theme mode, custom background colour."""
+        p = self._p
+        inner = self._create_tab_frame(self._notebook, "Theme / UI")
+
+        self._add_section_label(inner, "Theme Mode")
+
+        # -- Theme mode combo -------------------------------------------------
+        row = tk.Frame(inner, bg=p.bg)
+        row.pack(fill=tk.X, padx=12, pady=2)
+        tk.Label(row, text="Theme:", bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 10), width=24, anchor=tk.W).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+
+        current_theme = self._modified_config.get("theme", "auto")
+        if current_theme not in ("auto", "dark", "light"):
+            current_theme = "auto"
+        self._theme_var = tk.StringVar(value=current_theme)
+        combo = ttk.Combobox(
+            row, textvariable=self._theme_var,
+            values=["auto", "dark", "light"],
+            state="readonly", width=20,
+        )
+        combo.pack(side=tk.LEFT)
+        self._theme_combo = combo
+
+        # Theme help text
+        theme_help = tk.Frame(inner, bg=p.bg)
+        theme_help.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Label(
+            theme_help,
+            text=(
+                "auto   → detect system preference automatically\n"
+                "dark   → always use dark theme\n"
+                "light  → always use light theme"
+            ),
+            bg=p.bg,
+            fg=p.disabled_fg,
+            font=(self._ui_font, 9),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        # --- Custom Background Colour ---
+        self._add_section_label(inner, "Custom Background Colour")
+
+        row2 = tk.Frame(inner, bg=p.bg)
+        row2.pack(fill=tk.X, padx=12, pady=2)
+        tk.Label(row2, text="Background:", bg=p.bg, fg=p.fg,
+                 font=(self._ui_font, 10), width=24, anchor=tk.W).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+
+        custom_bg = self._modified_config.get("theme_custom_bg") or ""
+        self._custom_bg_var = tk.StringVar(value=custom_bg)
+        entry = tk.Entry(
+            row2,
+            textvariable=self._custom_bg_var,
+            bg=p.entry_bg,
+            fg=p.entry_fg,
+            insertbackground=p.entry_insert,
+            font=(self._mono_font, 10),
+            width=10,
+            relief=tk.FLAT,
+            highlightthickness=1,
+            highlightbackground=p.disabled_bg,
+            highlightcolor=p.accent,
+        )
+        entry.pack(side=tk.LEFT, padx=(0, 4))
+        self._custom_bg_entry = entry
+
+        # Preview swatch
+        self._swatch = tk.Label(
+            row2, text="    ", bg=p.bg, relief=tk.SOLID,
+            borderwidth=1, width=4,
+        )
+        self._swatch.pack(side=tk.LEFT, padx=8)
+        self._update_swatch()
+
+        # Swatch help
+        tk.Label(
+            inner,
+            text="Enter a hex colour (e.g. #0F141E) and click Apply to preview.\n"
+                 "Leave empty to use the theme's default background.",
+            bg=p.bg,
+            fg=p.disabled_fg,
+            font=(self._ui_font, 9),
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=12, pady=(4, 0))
+
+        # Apply Preview button
+        row3 = tk.Frame(inner, bg=p.bg)
+        row3.pack(fill=tk.X, padx=12, pady=(6, 12))
+        ttk.Button(
+            row3, text="🎨  Apply Preview",
+            style="Settings.TButton",
+            command=self._on_preview_theme,
+        ).pack(side=tk.LEFT)
+
+        # Reset custom bg button
+        ttk.Button(
+            row3, text="↩  Use Default",
+            style="Settings.TButton",
+            command=self._on_reset_custom_bg,
+        ).pack(side=tk.LEFT, padx=4)
+
+        # Theme note
+        note = tk.Frame(inner, bg=p.bg)
+        note.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Label(
+            note,
+            text="⚠ Theme changes take effect when you close and reopen the app.",
+            bg=p.bg,
+            fg=p.warning,
+            font=(self._ui_font, 8),
+            wraplength=400,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+    def _update_swatch(self) -> None:
+        """Update the colour preview swatch from the custom bg entry."""
+        val = self._custom_bg_var.get().strip()
+        if val.startswith("#") and len(val) == 7:
+            self._swatch.configure(bg=val)
+        else:
+            self._swatch.configure(bg=self._p.bg)
+
+    def _on_preview_theme(self) -> None:
+        """Apply the theme changes as a live preview."""
+        mode = self._theme_var.get()
+        custom_bg_raw = self._custom_bg_var.get().strip()
+        custom_bg = custom_bg_raw if (custom_bg_raw.startswith("#") and len(custom_bg_raw) == 7) else None
+
+        self._tm.set_theme(mode, custom_bg)
+        # Re-apply styles immediately for preview
+        self._tm.apply_ttk_styles()
+        # Update our palette reference
+        self._tm = ThemeManager()  # refresh singleton
+        self._update_swatch()
+        self._set_status("Theme preview applied.", self._p.success)
+
+    def _on_reset_custom_bg(self) -> None:
+        """Clear the custom background colour."""
+        self._custom_bg_var.set("")
+        self._update_swatch()
+        self._set_status("Custom background cleared.", self._p.success)
 
     # ------------------------------------------------------------------
     # Collect widget values into modified config
@@ -681,6 +848,14 @@ class SettingsPanel(tk.Toplevel):
             value = scale._var.get()
             _set_nested(self._modified_config, key_path, value)
 
+        # Theme fields
+        self._modified_config["theme"] = self._theme_var.get()
+        custom_bg = self._custom_bg_var.get().strip()
+        if custom_bg.startswith("#") and len(custom_bg) == 7:
+            self._modified_config["theme_custom_bg"] = custom_bg
+        else:
+            self._modified_config["theme_custom_bg"] = None
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
@@ -693,30 +868,37 @@ class SettingsPanel(tk.Toplevel):
         # Ollama URL: must start with http:// or https://
         url = str(_get_nested(self._modified_config, "ollama_url") or "")
         if url and not (url.startswith("http://") or url.startswith("https://")):
-            self._set_status("Ollama URL must start with http:// or https://", _DANGER)
+            self._set_status("Ollama URL must start with http:// or https://", self._p.danger)
             return False
 
         # MCP URL: must start with http:// or https://
         mcp_url = str(_get_nested(self._modified_config, "mcp_url") or "")
         if mcp_url and not (mcp_url.startswith("http://") or mcp_url.startswith("https://")):
-            self._set_status("MCP URL must start with http:// or https://", _DANGER)
+            self._set_status("MCP URL must start with http:// or https://", self._p.danger)
             return False
 
         # Numeric range checks
         timeout = _get_nested(self._modified_config, "llm_timeout_ms")
         if isinstance(timeout, (int, float)) and (timeout < 50 or timeout > 5000):
-            self._set_status("LLM Timeout must be between 50 and 5000 ms", _DANGER)
+            self._set_status("LLM Timeout must be between 50 and 5000 ms", self._p.danger)
             return False
 
         fps = _get_nested(self._modified_config, "frame_skip")
         if isinstance(fps, (int, float)) and (fps < 0 or fps > 60):
-            self._set_status("Frame Skip must be between 0 and 60", _DANGER)
+            self._set_status("Frame Skip must be between 0 and 60", self._p.danger)
             return False
 
         viz_conf = _get_nested(self._modified_config, "vision.confidence_threshold")
         if isinstance(viz_conf, (int, float)) and (viz_conf < 0.1 or viz_conf > 0.9):
-            self._set_status("Vision confidence threshold must be between 0.1 and 0.9", _DANGER)
+            self._set_status("Vision confidence threshold must be between 0.1 and 0.9", self._p.danger)
             return False
+
+        # Theme custom bg validation
+        custom_bg = self._modified_config.get("theme_custom_bg")
+        if custom_bg and isinstance(custom_bg, str):
+            if not (custom_bg.startswith("#") and len(custom_bg) == 7):
+                self._set_status("Custom background must be a hex colour like #0F141E", self._p.danger)
+                return False
 
         return True
 
@@ -734,10 +916,16 @@ class SettingsPanel(tk.Toplevel):
         try:
             self._save_config(self._modified_config)
             self._original_config = copy.deepcopy(self._modified_config)
-            self._set_status("Settings saved successfully.", _SUCCESS)
+
+            # Also push theme changes to ThemeManager
+            mode = self._modified_config.get("theme", "auto")
+            custom_bg = self._modified_config.get("theme_custom_bg")
+            self._tm.set_theme(mode, custom_bg)
+
+            self._set_status("Settings saved successfully.", self._p.success)
             self._logger.info("Settings saved to config.json.")
         except Exception as exc:
-            self._set_status(f"Failed to save: {exc}", _DANGER)
+            self._set_status(f"Failed to save: {exc}", self._p.danger)
             self._logger.error(f"Failed to save settings: {exc}")
 
     def _on_reset_defaults(self) -> None:
@@ -752,7 +940,7 @@ class SettingsPanel(tk.Toplevel):
         from src.config_manager import DEFAULT_CONFIG
 
         self._modified_config = copy.deepcopy(DEFAULT_CONFIG)
-        self._set_status("Reset to defaults. Re‑open to customise.", _WARNING)
+        self._set_status("Reset to defaults. Re‑open to customise.", self._p.warning)
         self._logger.info("Settings reset to defaults.")
 
         # We can't easily repopulate all widgets, so close & let user reopen
@@ -760,7 +948,7 @@ class SettingsPanel(tk.Toplevel):
 
     def _on_cancel(self) -> None:
         """Close without saving."""
-        self._set_status("Cancelled — no changes saved.", _WARNING)
+        self._set_status("Cancelled — no changes saved.", self._p.warning)
         self._logger.info("Settings panel cancelled.")
         self.destroy()
 
@@ -768,6 +956,8 @@ class SettingsPanel(tk.Toplevel):
     # Status helpers
     # ------------------------------------------------------------------
 
-    def _set_status(self, text: str, colour: str = _DISABLED_FG) -> None:
+    def _set_status(self, text: str, colour: str | None = None) -> None:
         """Update the status bar text and colour."""
+        if colour is None:
+            colour = self._p.disabled_fg
         self._lbl_status.config(text=text, fg=colour)

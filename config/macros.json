@@ -1,106 +1,372 @@
-{
-  "version": "1.0.0",
-  "macros": [
-    {
-      "name": "move_forward",
-      "description": "Press W for half a second",
-      "actions": [
-        {
-          "type": "key",
-          "key": "w",
-          "hold_ms": 500
-        }
-      ]
-    },
-    {
-      "name": "jump",
-      "description": "Quick spacebar tap",
-      "actions": [
-        {
-          "type": "key",
-          "key": "space",
-          "hold_ms": 100
-        }
-      ]
-    },
-    {
-      "name": "ui_click_top_left",
-      "description": "Move mouse to (100, 200) and left click",
-      "actions": [
-        {
-          "type": "mouse_move",
-          "x": 100,
-          "y": 200,
-          "relative": false
-        },
-        {
-          "type": "click",
-          "button": "left"
-        }
-      ]
-    },
-    {
-      "name": "pause_menu",
-      "description": "Press Escape to open pause menu",
-      "actions": [
-        {
-          "type": "key",
-          "key": "escape",
-          "hold_ms": 100
-        }
-      ]
-    },
-    {
-      "name": "jump_attack",
-      "description": "Jump, wait 500ms, then attack",
-      "actions": [
-        {
-          "type": "key",
-          "key": "space",
-          "hold_ms": 100
-        },
-        {
-          "type": "delay",
-          "ms": 500
-        },
-        {
-          "type": "key",
-          "key": "a",
-          "hold_ms": 100
-        }
-      ]
-    },
-    {
-      "name": "test",
-      "description": "Test01",
-      "actions": [
-        {
-          "type": "key",
-          "key": "d",
-          "hold_ms": 100
-        },
-        {
-          "type": "key",
-          "key": "a",
-          "hold_ms": 100
-        },
-        {
-          "type": "key",
-          "key": "y",
-          "hold_ms": 100
-        }
-      ]
-    },
-    {
-      "name": "new_macro",
-      "description": "Describe this macro",
-      "actions": [
-        {
-          "type": "key",
-          "key": "a",
-          "hold_ms": 100
-        }
-      ]
-    }
-  ]
-}
+[
+  {
+    "name": "move_forward",
+    "description": "Press W for half a second",
+    "actions": [
+      {
+        "type": "key",
+        "key": "w",
+        "hold_ms": 500
+      }
+    ]
+  },
+  {
+    "name": "jump",
+    "description": "Quick spacebar tap",
+    "actions": [
+      {
+        "type": "key",
+        "key": "space",
+        "hold_ms": 100
+      }
+    ]
+  },
+  {
+    "name": "ui_click_top_left",
+    "description": "Move mouse to (100, 200) and left click",
+    "actions": [
+      {
+        "type": "mouse_move",
+        "x": 100,
+        "y": 200,
+        "relative": false
+      },
+      {
+        "type": "click",
+        "button": "left"
+      }
+    ]
+  },
+  {
+    "name": "pause_menu",
+    "description": "Press Escape to open pause menu",
+    "actions": [
+      {
+        "type": "key",
+        "key": "escape",
+        "hold_ms": 100
+      }
+    ]
+  },
+  {
+    "name": "jump_attack",
+    "description": "Jump, wait 500ms, then attack",
+    "actions": [
+      {
+        "type": "key",
+        "key": "space",
+        "hold_ms": 100
+      },
+      {
+        "type": "delay",
+        "ms": 500
+      },
+      {
+        "type": "key",
+        "key": "a",
+        "hold_ms": 100
+      }
+    ]
+  },
+  {
+    "name": "test",
+    "description": "Test01",
+    "actions": [
+      {
+        "type": "key",
+        "key": "d",
+        "hold_ms": 100
+      },
+      {
+        "type": "key",
+        "key": "a",
+        "hold_ms": 100
+      },
+      {
+        "type": "key",
+        "key": "y",
+        "hold_ms": 100
+      }
+    ]
+  },
+  {
+    "name": "Hello There",
+    "description": "Describe this macro",
+    "actions": [
+      {
+        "type": "type_string",
+        "text": "Hello THere"
+      },
+      {
+        "type": "mouse_move",
+        "x": 0,
+        "y": 0,
+        "relative": false
+      },
+      {
+        "type": "dynamic_click",
+        "target_class": "person",
+        "selection_strategy": "nearest_to_center",
+        "reference_point": null,
+        "button": "left"
+      }
+    ]
+  },
+  {
+    "name": "new_macro",
+    "description": "",
+    "actions": []
+  },
+  {
+    "name": "testonly_move_circle",
+    "description": "Trace a circle via relative mouse deltas (~200px radius, works on any window)",
+    "actions": [
+      {
+        "type": "mouse_move",
+        "x": -15,
+        "y": 77,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": -43,
+        "y": 65,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": -65,
+        "y": 43,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": -77,
+        "y": 15,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": -77,
+        "y": -15,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": -65,
+        "y": -43,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": -43,
+        "y": -65,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": -15,
+        "y": -77,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": 15,
+        "y": -77,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": 43,
+        "y": -65,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": 65,
+        "y": -43,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": 77,
+        "y": -15,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": 77,
+        "y": 15,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": 65,
+        "y": 43,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": 43,
+        "y": 65,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "mouse_move",
+        "x": 15,
+        "y": 77,
+        "relative": true
+      }
+    ]
+  },
+  {
+    "name": "testonly_move_star",
+    "description": "Trace a 5-pointed star via relative mouse deltas (outer radius ~80px, works on any window)",
+    "actions": [
+      {
+        "type": "mouse_move",
+        "x": -47,
+        "y": 145,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 80
+      },
+      {
+        "type": "mouse_move",
+        "x": 123,
+        "y": -89,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 80
+      },
+      {
+        "type": "mouse_move",
+        "x": -152,
+        "y": 0,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 80
+      },
+      {
+        "type": "mouse_move",
+        "x": 123,
+        "y": 89,
+        "relative": true
+      },
+      {
+        "type": "delay",
+        "ms": 80
+      },
+      {
+        "type": "mouse_move",
+        "x": -47,
+        "y": -145,
+        "relative": true
+      }
+    ]
+  },
+  {
+    "name": "testonly_move_corners",
+    "description": "Move in a diamond/square via WASD keys (works on any window)",
+    "actions": [
+      {
+        "type": "key",
+        "key": "a",
+        "hold_ms": 800
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "key",
+        "key": "w",
+        "hold_ms": 800
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "key",
+        "key": "d",
+        "hold_ms": 800
+      },
+      {
+        "type": "delay",
+        "ms": 50
+      },
+      {
+        "type": "key",
+        "key": "s",
+        "hold_ms": 800
+      }
+    ]
+  }
+]

@@ -153,13 +153,16 @@ async def accurate_hold(duration_seconds: float, token: Optional[CancellationTok
     if duration_seconds <= 0.0:
         return
 
+    # Capture the overall start time so the total hold = duration_seconds.
+    overall_start = time.perf_counter()
+
     if duration_seconds < 0.020:  # pure busy‑wait for very short holds
-        start = time.perf_counter()
-        while (time.perf_counter() - start) < duration_seconds:
+        while (time.perf_counter() - overall_start) < duration_seconds:
             if token and token.cancelled:
                 raise MacroCancelledError()
             # Yield occasionally to avoid starving the event loop
-            if (time.perf_counter() - start) > duration_seconds * 0.5:
+            elapsed = time.perf_counter() - overall_start
+            if elapsed > duration_seconds * 0.5:
                 await asyncio.sleep(0)
         return
 
@@ -170,12 +173,12 @@ async def accurate_hold(duration_seconds: float, token: Optional[CancellationTok
         if token and token.cancelled:
             raise MacroCancelledError()
 
-    start = time.perf_counter()
-    remaining = max(duration_seconds - (time.perf_counter() - start), 0.0)
+    # Fine‑tune the remainder from the overall start time
+    remaining = max(duration_seconds - (time.perf_counter() - overall_start), 0.0)
     while remaining > 0.0:
         if token and token.cancelled:
             raise MacroCancelledError()
-        remaining = max(duration_seconds - (time.perf_counter() - start), 0.0)
+        remaining = max(duration_seconds - (time.perf_counter() - overall_start), 0.0)
         if remaining < 0.001:
             break
         await asyncio.sleep(0)
@@ -192,7 +195,7 @@ class MacroExecutor:
 
     Usage::
 
-        executor = MacroExecutor(input_ctrl)
+        executor = MacroExecutor(input_ctrl, config=config)
         await executor.start()
 
         future = await executor.submit(
@@ -204,7 +207,9 @@ class MacroExecutor:
     """
 
     # ------------------------------------------------------------------
-    def __init__(self, input_controller: Any, max_queue_size: int = 32) -> None:
+    def __init__(
+        self, input_controller: Any, max_queue_size: int = 32, config: Optional[dict[str, Any]] = None,
+    ) -> None:
         """
         Parameters
         ----------
@@ -213,15 +218,24 @@ class MacroExecutor:
         max_queue_size : int
             Maximum number of pending macro requests.  Surplus submissions
             will raise MacroRejectedError.
+        config : dict or None
+            Global configuration dict (reads ``mouse_speed`` for smooth movement).
         """
         self._input = input_controller
+        self._config = config or {}
         self._queue: asyncio.PriorityQueue[tuple[int, MacroRequest]] = asyncio.PriorityQueue(
             maxsize=max_queue_size
         )
         self._current_task: Optional[asyncio.Task[None]] = None
+        self._current_priority: Optional[int] = None  # priority of executing macro
+        self._current_macro: Optional[MacroRequest] = None  # executing macro (for preemption resolution)
         self._consumer_task: Optional[asyncio.Task[None]] = None
         self._pending: dict[str, MacroRequest] = {}  # queued, not yet executing
         self._running = False
+        self._preempting: bool = False  # True when cancel_current is called for preemption
+
+        # Timing audit toggle (enabled by default; tests can disable it).
+        self._timing_log_enabled: bool = False
 
         # Track keys that are currently pressed so they can be released on cancel.
         self._held_keys: set[str] = set()
@@ -309,13 +323,83 @@ class MacroExecutor:
         while not self._queue.empty():
             self._queue.get_nowait()
         # Cancel the currently running macro
-        if self._current_task and not self._current_task.done():
-            self._current_task.cancel()
-            try:
-                await self._current_task
-            except asyncio.CancelledError:
-                pass
+        await self.cancel_current()
         logger.debug("All macros cancelled")
+
+    async def cancel_current(self) -> bool:
+        """Cancel only the currently executing macro (not queued items).
+
+        Returns ``True`` if a running macro was cancelled, ``False`` if
+        nothing was executing.
+
+        The key‑up guarantee is preserved — the cancelled macro's
+        ``finally`` block will release all held keys.  The consumer
+        resolves the macro's future with ``MacroCancelledError`` and
+        then continues to the next queued item.
+        """
+        if self._current_task is None or self._current_task.done():
+            return False
+        logger.info("Cancelling currently executing macro (priority=%s)", self._current_priority)
+        # Signal preemption so the consumer resolves the future cleanly
+        # instead of treating this as an unrecoverable consumer failure.
+        self._preempting = True
+        self._current_task.cancel()
+        try:
+            await self._current_task
+        except asyncio.CancelledError:
+            pass
+        return True
+
+    async def submit_and_preempt(self, macro: MacroRequest) -> asyncio.Future[None]:
+        """Submit *macro*, preempting a lower-priority running macro if necessary.
+
+        If a macro is currently executing and its priority is **lower**
+        (higher numeric value) than *macro*, the running macro is cancelled
+        (with full key release), its future is resolved with
+        ``MacroCancelledError``, and *macro* is injected at the front of
+        the queue so the consumer picks it up next.
+
+        If the current macro has **equal or higher** priority, *macro* is
+        enqueued normally via :meth:`submit`.
+
+        Returns the ``Future`` for *macro* (same as :meth:`submit`).
+        """
+        # --- Preempt condition ---
+        if (
+            self._current_task is not None
+            and not self._current_task.done()
+            and self._current_priority is not None
+            and self._current_priority > macro.priority  # lower numeric = higher urgency
+        ):
+            logger.info(
+                "Preempting running macro (priority=%d) for '%s' (priority=%d)",
+                self._current_priority,
+                macro.name,
+                macro.priority,
+            )
+            # Signal preemption so the consumer resolves the cancelled macro's
+            # future with MacroCancelledError rather than treating it as shutdown.
+            self._preempting = True
+            # Cancel the current macro — its finally block releases keys
+            await self.cancel_current()
+            # Push the new macro to the front of the priority queue so it
+            # is consumed next.
+            try:
+                self._queue.put_nowait((macro.priority, macro))
+            except asyncio.QueueFull:
+                raise MacroRejectedError(
+                    f"Macro queue full (max={self._queue.maxsize}). "
+                    f"Macro '{macro.name}' rejected during preemption."
+                ) from None
+            self._pending[macro.id] = macro
+            logger.debug(
+                "Macro '%s' enqueued via preemption (priority=%d, id=%s)",
+                macro.name, macro.priority, macro.id,
+            )
+            return macro.future
+
+        # --- No preemption needed — normal submission ---
+        return await self.submit(macro)
 
     # ------------------------------------------------------------------
     # Consumer
@@ -335,6 +419,8 @@ class MacroExecutor:
                 raise
 
             self._pending.pop(macro.id, None)  # now executing, no longer pending
+            self._current_priority = priority
+            self._current_macro = macro
             logger.debug("Executing macro '%s' (priority=%d)", macro.name, priority)
 
             try:
@@ -343,18 +429,31 @@ class MacroExecutor:
                 if not macro.future.done():
                     macro.future.set_result(None)
             except asyncio.CancelledError:
-                # The consumer itself was cancelled (stop / cancel_all).
-                for m in self._pending.values():
-                    if not m.future.done():
-                        m.future.cancel()
-                self._pending.clear()
-                raise
+                # Was this cancelled for preemption?
+                if self._preempting and not macro.future.done():
+                    # Resolve with MacroCancelledError so the caller can distinguish
+                    macro.future.set_exception(
+                        MacroCancelledError(
+                            f"Macro '{macro.name}' preempted by higher-priority request."
+                        )
+                    )
+                    self._preempting = False
+                else:
+                    # Consumer itself was cancelled (stop / cancel_all).
+                    for m in self._pending.values():
+                        if not m.future.done():
+                            m.future.cancel()
+                    self._pending.clear()
+                    raise
             except Exception as exc:
                 if not macro.future.done():
                     macro.future.set_exception(exc)
                 logger.error("Macro '%s' failed: %s", macro.name, exc)
             finally:
                 self._current_task = None
+                self._current_priority = None
+                self._current_macro = None
+                self._preempting = False
                 self._queue.task_done()
 
     # ------------------------------------------------------------------
@@ -398,39 +497,69 @@ class MacroExecutor:
         held: set[str],
     ) -> None:
         """Iterate through *actions*, checking *token*.cancelled at each step."""
+        _timing_log_enabled = getattr(self, "_timing_log_enabled", False)
+
         for i, step in enumerate(actions):
             if token.cancelled:
                 raise MacroCancelledError()
 
             step_type = step.get("type")
             try:
-                if step_type == "key":
+                if step_type in ("key", "key_press", "key_hold"):
                     key = step["key"]
-                    hold_ms = int(step.get("hold_ms", 50))
+                    hold_ms = int(step.get("hold_ms", step.get("duration", 50)))
                     duration = hold_ms / 1000.0
 
+                    if _timing_log_enabled:
+                        t0 = time.perf_counter()
                     await self._input.key_down(key)
                     held.add(key)
                     await accurate_hold(duration, token=token)
                     await self._input.key_up(key)
                     held.discard(key)
+                    if _timing_log_enabled:
+                        actual_ms = (time.perf_counter() - t0) * 1000
+                        drift = abs(actual_ms - hold_ms)
+                        if drift > 10:
+                            logger.debug(
+                                "Key hold drift @ step[%d] '%s': expected %dms, actual %.2fms (drift %.2fms)",
+                                i, key, hold_ms, actual_ms, drift,
+                            )
 
-                elif step_type == "delay":
-                    ms = int(step.get("ms", 100))
+                elif step_type in ("delay", "wait"):
+                    ms = int(step.get("ms", step.get("duration", 100)))
+                    if _timing_log_enabled:
+                        t0 = time.perf_counter()
                     await accurate_hold(ms / 1000.0, token=token)
+                    if _timing_log_enabled:
+                        actual_ms = (time.perf_counter() - t0) * 1000
+                        drift = abs(actual_ms - ms)
+                        if drift > 10:
+                            logger.debug(
+                                "Wait drift @ step[%d]: expected %dms, actual %.2fms (drift %.2fms)",
+                                i, ms, actual_ms, drift,
+                            )
 
                 elif step_type == "mouse_move":
-                    await self._input.move_mouse(
+                    mouse_speed = float(self._config.get("mouse_speed", 1.0))
+                    await self._input.move_mouse_smooth(
                         x=int(step["x"]),
                         y=int(step["y"]),
+                        speed=mouse_speed,
                         relative=bool(step.get("relative", False)),
                     )
 
-                elif step_type == "click":
+                elif step_type in ("click", "mouse_click"):
                     await self._input.click(button=step.get("button", "left"))
 
                 elif step_type == "type_string":
                     await self._input.type_string(str(step.get("text", "")))
+
+                elif step_type in ("dynamic_click", "dynamic_move", "dynamic_attack"):
+                    raise MacroError(
+                        f"Unresolved dynamic step type at index {i}: {step_type!r}. "
+                        f"Dynamic steps must be resolved by MacroResolver before reaching MacroExecutor."
+                    )
 
                 else:
                     raise MacroError(f"Unknown macro step type at index {i}: {step_type!r}")

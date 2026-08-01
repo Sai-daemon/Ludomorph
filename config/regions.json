@@ -11,10 +11,6 @@
         300,
         230
       ],
-      "preprocess": [
-        "grayscale",
-        "threshold"
-      ],
       "calibration": {
         "enabled": true,
         "bar_type": "solid_horizontal",
@@ -44,7 +40,11 @@
         "method": "projection",
         "confidence_threshold": 0.6,
         "dynamic_adjustment": true
-      }
+      },
+      "preprocess": [
+        "grayscale",
+        "threshold"
+      ]
     },
     {
       "name": "hp_text",
@@ -77,10 +77,6 @@
         300,
         300
       ],
-      "preprocess": [
-        "grayscale",
-        "threshold"
-      ],
       "calibration": {
         "enabled": true,
         "bar_type": "solid_horizontal",
@@ -110,7 +106,11 @@
         "method": "projection",
         "confidence_threshold": 0.6,
         "dynamic_adjustment": true
-      }
+      },
+      "preprocess": [
+        "grayscale",
+        "threshold"
+      ]
     },
     {
       "name": "mana_text",
@@ -212,5 +212,9 @@
         "cache_ttl_seconds": 2.0
       }
     }
-  ]
+  ],
+  "source_resolution": {
+    "width": 1278,
+    "height": 686
+  }
 }

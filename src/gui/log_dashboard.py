@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from tkinter import ttk
 from typing import Any
 
+from src.gui.theme import ThemeManager, resolve_font_stack
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -25,16 +27,26 @@ _MAX_LINES: int = 5_000  # hard cap to prevent unbounded memory growth
 _LOG_FORMAT: str = (
     "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}"
 )
-# Map loguru level names to tkinter tag names for colouring
-_LEVEL_COLOURS: dict[str, str] = {
-    "TRACE": "#808080",   # grey
-    "DEBUG": "#4A90D9",   # muted blue
-    "INFO": "#E8E8E8",    # near-white
-    "SUCCESS": "#50C878",  # green
-    "WARNING": "#E8A317",  # amber
-    "ERROR": "#E04040",    # red
-    "CRITICAL": "#FF00FF",  # magenta
-}
+# Map loguru level names to palette-derived colours.
+# Call _build_level_colours() after ThemeManager is initialised.
+_LEVEL_COLOURS: dict[str, str] = {}
+
+
+def _build_level_colours(palette: Any) -> dict[str, str]:
+    """Return log-level → foreground colour mappings from *palette*.
+    
+    Called once at construction and again on theme change so log text
+    stays readable in both dark and light modes.
+    """
+    return {
+        "TRACE": palette.disabled_fg,
+        "DEBUG": palette.accent,
+        "INFO": palette.fg,
+        "SUCCESS": palette.success,
+        "WARNING": palette.warning,
+        "ERROR": palette.danger,
+        "CRITICAL": "#FF00FF",  # magenta — works on both dark & light
+    }
 
 # ---------------------------------------------------------------------------
 # module-level reference to the active GUI sink id
@@ -60,15 +72,22 @@ class LogDashboard(tk.Frame):  # type: ignore[misc]
         self._max_lines = max_lines
         self._line_count: int = 0
 
+        self._tm = ThemeManager()
+        p = self._tm.palette
+        self._mono_font = resolve_font_stack(p.mono_font)
+
+        # -- Build level colour map from palette -----------------------------
+        self._level_colours = _build_level_colours(p)
+
         # -- Build widgets ---------------------------------------------------
         self._text = tk.Text(
             self,
             wrap=tk.WORD,
             state=tk.DISABLED,
-            bg="#1E1E1E",   # dark background
-            fg="#D4D4D4",   # light text
-            insertbackground="#D4D4D4",
-            font=("Cascadia Code", 10),
+            bg=p.bg,
+            fg=p.fg,
+            insertbackground=p.fg,
+            font=(self._mono_font, 10),
             relief=tk.FLAT,
             borderwidth=0,
             highlightthickness=0,
@@ -82,12 +101,7 @@ class LogDashboard(tk.Frame):  # type: ignore[misc]
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # -- Configure text tags for colouring -------------------------------
-        for level_name, colour in _LEVEL_COLOURS.items():
-            self._text.tag_configure(level_name, foreground=colour)
-
-        # Additional utility tags
-        self._text.tag_configure("timestamp", foreground="#6A9955")  # dim green
-        self._text.tag_configure("location", foreground="#808080")   # dim grey
+        self._configure_tags(p)
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,7 +120,7 @@ class LogDashboard(tk.Frame):  # type: ignore[misc]
         self._text.insert(tk.END, timestamp, ("timestamp",))
         self._text.insert(tk.END, " | ")
 
-        level_tag = level if level in _LEVEL_COLOURS else None
+        level_tag = level if level in self._level_colours else None
         if level_tag:
             self._text.insert(tk.END, f"{level:<8}", (level_tag,))
         else:
@@ -130,6 +144,27 @@ class LogDashboard(tk.Frame):  # type: ignore[misc]
 
         # -- Auto-scroll to bottom ------------------------------------------
         self._text.see(tk.END)
+
+    # ------------------------------------------------------------------
+    # Theme support
+    # ------------------------------------------------------------------
+
+    def _configure_tags(self, p: Any) -> None:
+        """(Re)configure all text tags from the active palette."""
+        self._level_colours = _build_level_colours(p)
+        for level_name, colour in self._level_colours.items():
+            self._text.tag_configure(level_name, foreground=colour)
+        self._text.tag_configure("timestamp", foreground=p.disabled_fg)
+        self._text.tag_configure("location", foreground=p.disabled_fg)
+
+    def _apply_theme(self) -> None:
+        """Update colours after a theme change."""
+        p = self._tm.palette
+        self._mono_font = resolve_font_stack(p.mono_font)
+        self._text.configure(bg=p.bg, fg=p.fg, insertbackground=p.fg,
+                             font=(self._mono_font, 10))
+        # Re-tag all text with palette-aware colours
+        self._configure_tags(p)
 
     # ------------------------------------------------------------------
     # Internal helpers
